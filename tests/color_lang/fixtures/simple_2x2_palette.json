@@ -1,0 +1,13 @@
+{
+    "version": "palette-v0.1",
+    "tile_size": 1,
+    "scan_order": "row-major",
+    "opcodes": {
+        "FF0000": "RED_OP",
+        "00FF00": "GREEN_OP",
+        "0000FF": "BLUE_OP",
+        "FFFFFF": "WHITE_OP"
+    },
+    "immediate_mode": "rgb-to-int",
+    "tolerance": 5.0
+}
