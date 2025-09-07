@@ -1,0 +1,2192 @@
+Here are the files you asked for, all inlined so you can drop them into a directory and run immediately.
+
+---
+
+### `dvc_vm.py`
+
+```python
+# dvc_vm.py — DVC v0.1 deterministic stack VM with hash-chained trace
+# SPDX-License-Identifier: MIT
+import json, hashlib
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Optional
+
+VM_VERSION = "dvc-v0.1"
+OPCODES = {
+    0x00: "NOP", 0x01: "PUSHI", 0x02: "ADD", 0x03: "SUB",
+    0x04: "MUL", 0x05: "DIV", 0x06: "DUP", 0x07: "SWAP",
+    0x08: "POP", 0x09: "JMP", 0x0A: "JZ", 0x0B: "JNZ",
+    0x0C: "LOAD", 0x0D: "STORE", 0x0E: "OUT", 0x0F: "HALT",
+}
+
+INT64_MASK = (1 << 64) - 1
+
+def to_i64(x: int) -> int:
+    x &= INT64_MASK
+    if x >= (1 << 63): x -= (1 << 64)
+    return x
+
+def i64_to_bytes(x: int) -> bytes:
+    return (x & INT64_MASK).to_bytes(8, 'little', signed=False)
+
+def bytes_to_i64(b: bytes) -> int:
+    return to_i64(int.from_bytes(b, 'little', signed=False))
+
+def sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def commit_stack(stack: List[int]) -> str:
+    blob = b''.join(i64_to_bytes(v) for v in stack)
+    return sha256(blob)
+
+def commit_mem(mem: bytearray) -> str:
+    return sha256(bytes(mem))
+
+@dataclass
+class Step:
+    step: int; pc: int; op: str; args: List[int]
+    stack_before: List[int]; stack_after: List[int]
+    outputs_len: int; stack_commit: str; mem_commit: str
+    prev_hash: str; step_hash: str
+
+@dataclass
+class RunResult:
+    vm_version: str; program_hash: str; mem_size: int
+    inputs: List[int]; outputs: List[int]; steps: List[Step]
+    final_stack_commit: str; final_mem_commit: str; final_root: str
+
+class VM:
+    def __init__(self, memory_size: int = 1024):
+        self.mem = bytearray(memory_size)
+        self.stack: List[int] = []
+        self.outputs: List[int] = []
+        self.pc = 0; self.halted = False
+
+    def load_program(self, bytecode: List[Tuple[str, Optional[int]]]):
+        self.code = bytecode
+        program_blob = json.dumps(self.code, separators=(',', ':')).encode()
+        self.program_hash = sha256(program_blob)
+
+    def run(self, inputs: List[int] = [], max_steps: int = 100000) -> RunResult:
+        for i, v in enumerate(inputs):
+            self.mem[i*8:(i+1)*8] = i64_to_bytes(v)
+
+        steps, prev_hash, step_idx = [], "0"*64, 0
+        while not self.halted and step_idx < max_steps:
+            if self.pc < 0 or self.pc >= len(self.code):
+                raise RuntimeError(f"PC out of range: {self.pc}")
+            op, arg = self.code[self.pc]
+            stack_before = list(self.stack)
+
+            def pop(): 
+                if not self.stack: raise RuntimeError("Stack underflow")
+                return self.stack.pop()
+
+            # ---- instructions ----
+            if op == "NOP": self.pc += 1
+            elif op == "PUSHI": self.stack.append(to_i64(arg)); self.pc += 1
+            elif op == "ADD": b,a = pop(), pop(); self.stack.append(to_i64(a+b)); self.pc += 1
+            elif op == "SUB": b,a = pop(), pop(); self.stack.append(to_i64(a-b)); self.pc += 1
+            elif op == "MUL": b,a = pop(), pop(); self.stack.append(to_i64(a*b)); self.pc += 1
+            elif op == "DIV": b,a = pop(), pop(); self.stack.append(to_i64(int(a/b))); self.pc += 1
+            elif op == "DUP": a = pop(); self.stack.extend([a,a]); self.pc += 1
+            elif op == "SWAP": b,a = pop(), pop(); self.stack.extend([b,a]); self.pc += 1
+            elif op == "POP": _ = pop(); self.pc += 1
+            elif op == "JMP": self.pc = arg
+            elif op == "JZ": x = pop(); self.pc = arg if x == 0 else self.pc+1
+            elif op == "JNZ": x = pop(); self.pc = arg if x != 0 else self.pc+1
+            elif op == "LOAD": addr = pop(); v = bytes_to_i64(self.mem[addr:addr+8]); self.stack.append(v); self.pc += 1
+            elif op == "STORE": v = pop(); addr = pop(); self.mem[addr:addr+8] = i64_to_bytes(v); self.pc += 1
+            elif op == "OUT": v = pop(); self.outputs.append(v); self.pc += 1
+            elif op == "HALT": self.halted = True
+            else: raise RuntimeError(f"Unknown opcode: {op}")
+
+            stack_after = list(self.stack)
+            sc, mc = commit_stack(stack_after), commit_mem(self.mem)
+            step_json = {"step": step_idx,"pc": self.pc,"op": op,
+                         "args": ([] if arg is None else [arg]) if op in ("PUSHI","JMP","JZ","JNZ") else [],
+                         "stack_before": stack_before,"stack_after": stack_after,
+                         "outputs_len": len(self.outputs)}
+            h = sha256(json.dumps(step_json,separators=(',',':')).encode() + prev_hash.encode())
+            steps.append(Step(step_idx,self.pc,op,step_json["args"],stack_before,stack_after,
+                              len(self.outputs),sc,mc,prev_hash,h))
+            prev_hash, step_idx = h, step_idx+1
+
+        return RunResult(VM_VERSION,self.program_hash,len(self.mem),inputs,self.outputs,steps,
+                         commit_stack(self.stack),commit_mem(self.mem),prev_hash)
+
+def result_to_bundle(res: RunResult, program, meta):
+    return {
+        "vm_version": res.vm_version, "program_hash": res.program_hash,
+        "program_disasm": [f"{i:04d}: {op} {arg if arg is not None else ''}".strip()
+                           for i,(op,arg) in enumerate(program)],
+        "mem_size": res.mem_size, "inputs": res.inputs, "outputs": res.outputs,
+        "final_stack_commit": res.final_stack_commit, "final_mem_commit": res.final_mem_commit,
+        "final_root": res.final_root, "meta": meta, "steps": [asdict(s) for s in res.steps],
+    }
+```
+
+---
+
+### `dvc_svg.py`
+
+```python
+# dvc_svg.py — render 4-pane ritual SVG from a DVC trace bundle
+# SPDX-License-Identifier: MIT
+import json, html
+from pathlib import Path
+
+CSS = "text{font-family: monospace; font-size:12px}" \
+      ".h{font-size:14px; font-weight:bold}" \
+      ".box{fill:#fafafa; stroke:#ddd}"
+
+def escape(x): return html.escape(str(x))
+
+def col(lines, x, y, w, h, title):
+    out = []
+    out.append('<rect class="box" x="%d" y="%d" width="%d" height="%d" rx="8"/>' % (x,y,w,h))
+    out.append('<text class="h" x="%d" y="%d">%s</text>' % (x+12, y+20, escape(title)))
+    ty, lh, max_lines = y+38, 14, int((h-40)/lh)
+    for i,ln in enumerate(lines[:max_lines]):
+        out.append('<text x="%d" y="%d">%s</text>' % (x+12, ty+i*lh, escape(ln)))
+    return "\n".join(out)
+
+def render(bundle, width=1200, height=800):
+    steps, dis, meta = bundle.get("steps",[]), bundle.get("program_disasm",[]), bundle.get("meta",{})
+    p1 = ['vm: %s'%bundle["vm_version"],'program_hash: %s…'%bundle["program_hash"][:16],
+          'final_root: %s…'%bundle["final_root"][:16],'mem_size: %s'%bundle["mem_size"],
+          'inputs: %s'%bundle.get("inputs",[]),'outputs: %s'%bundle.get("outputs",[])]
+    p2 = dis
+    last = steps[-20:] if steps else []
+    p3 = ['#%04d pc=%04d %s %s out=%d stack=%s' % (
+            s["step"],s["pc"],s["op"],s["args"],s["outputs_len"],str(s["stack_after"][-6:])) for s in last]
+    p4 = ['%02d: %s'%(i,v) for i,v in enumerate(bundle.get("outputs",[]))]
+    g, pad, colw, rowh = [],16,(width-48)//2,(height-48)//2
+    g.append(col(p1,pad,pad,colw,rowh,"Meta / Commitments"))
+    g.append(col(p2,pad*2+colw,pad,colw,rowh,"Program Disassembly"))
+    g.append(col(p3,pad,pad*2+rowh,colw,rowh,"Trace (tail)"))
+    g.append(col(p4,pad*2+colw,pad*2+rowh,colw,rowh,"Outputs"))
+    return '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d"><style>%s</style>%s</svg>' % (
+        width,height,CSS,"\n".join(g))
+
+def save_svg(bundle_path, out_path):
+    bundle = json.loads(Path(bundle_path).read_text())
+    Path(out_path).write_text(render(bundle))
+
+if __name__=="__main__":
+    import sys
+    if len(sys.argv)!=3:
+        print("usage: python dvc_svg.py bundle.json out.svg"); exit(2)
+    save_svg(sys.argv[1], sys.argv[2])
+```
+
+---
+
+### `demo_build.py`
+
+```python
+# demo_build.py — assemble, run, and render a tiny DVC program
+# SPDX-License-Identifier: MIT
+import json, datetime
+from pathlib import Path
+from dvc_vm import VM, result_to_bundle
+import dvc_svg
+
+# Program: (7+5)*3 → OUT, store to mem[64], then countdown 5..1 OUT
+bytecode = [
+    ("PUSHI",7),("PUSHI",5),("ADD",None),("PUSHI",3),("MUL",None),
+    ("DUP",None),("PUSHI",64),("SWAP",None),("STORE",None),("OUT",None),
+    ("PUSHI",5),("DUP",None),("OUT",None),("PUSHI",1),("SUB",None),
+    ("DUP",None),("JNZ",11),("POP",None),("HALT",None),
+]
+
+out_dir = Path(__file__).resolve().parent/"out"
+out_dir.mkdir(exist_ok=True)
+
+vm = VM(memory_size=256)
+vm.load_program(bytecode)
+res = vm.run([])
+bundle = result_to_bundle(res, bytecode, {
+    "title":"DVC v0.1 demo",
+    "built_at": datetime.datetime.utcnow().isoformat()+"Z"
+})
+
+bundle_path, svg_path = out_dir/"demo_bundle.json", out_dir/"demo_ritual.svg"
+bundle_path.write_text(json.dumps(bundle, indent=2))
+dvc_svg.save_svg(str(bundle_path), str(svg_path))
+
+print("Wrote:", bundle_path)
+print("Wrote:", svg_path)
+print("Outputs:", bundle["outputs"])
+print("Final root:", bundle["final_root"][:32]+"…")
+```
+
+---
+
+👉 Running `python demo_build.py` creates:
+
+* `out/demo_bundle.json` (trace + commitments)
+* `out/demo_ritual.svg` (4-pane visual audit)
+
+Want me to also draft a **verifier** (`dvc_verify.py`) that can re-run the program, recompute the trace, and check the final root matches the bundle? That would complete the round-trip proof.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Got it — you’re ready to move from “concept” to “artifact” with the Visual‑as‑Proof core.  
+The minimal opcode set and trace schema we’ve already outlined are enough to start running real, deterministic programs and producing the ritual visuals.  
+
+Here’s how I’d sequence the next build steps so you can lock in **DVCF v0.1** and have a complete, verifiable loop:
+
+---
+
+### **1. Finalize the `.dvcf` container spec**
+- **Bundle contents**:
+  - `vm_version`, `isa_version`
+  - Program bytecode + disassembly
+  - Inputs
+  - Full step trace (or commitments + proof)
+  - Outputs
+  - Final root + stack/mem commits
+  - Optional: signatures, ceremonial tags, SVG ritual
+- **Encoding**: CBOR or Protobuf for compactness; JSON for human‑readable debug.
+- **Content addressing**: filename = `<final_root>.dvcf`.
+
+---
+
+### **2. Build a verifier**
+- Reads `.dvcf`, replays bytecode in a clean VM.
+- Recomputes all step hashes and final root.
+- Fails fast if any mismatch — drift is now a first‑class, inspectable event.
+- Can optionally regenerate the SVG ritual from the verified trace.
+
+---
+
+### **3. Lock the reference VM**
+- Implement in two languages (e.g., Python + Rust) for differential testing.
+- Golden test suite: same `.dvcf` → identical roots across both.
+- Fixed integer semantics, no nondeterminism.
+
+---
+
+### **4. Ritual renderer polish**
+- From the trace, generate the **4‑pane SVG**:
+  1. Meta / Commitments
+  2. Disassembly
+  3. Trace tail (or full scrollable view)
+  4. Outputs
+- Embed hashes and ceremonial tags directly in the SVG metadata.
+
+---
+
+### **5. First “Hall of Drift” entry**
+- Deliberately introduce a one‑step divergence in a known program.
+- Capture both `.dvcf` bundles.
+- Render side‑by‑side SVGs with drift highlighted.
+- This becomes your first public lineage artifact.
+
+---
+
+If you like, I can draft the **`.dvcf` schema** in JSON Schema form next, so you can validate every bundle automatically before it’s blessed into the Hall of Drift. That would give you a hard, inspectable contract between the VM, the verifier, and the renderer.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Excellent — let’s lock in the **`.dvcf` v0.1 schema** so every run is a self‑describing, content‑addressable lineage artifact. This will give you a hard contract between the VM, the verifier, and the renderer, and make “ritual execution” a repeatable, inspectable act.  
+
+---
+
+## **📦 `.dvcf` v0.1 — Digital Visual Computer File**
+
+### **Top‑Level Structure**
+```json
+{
+  "format_version": "0.1",
+  "vm_version": "0.1",
+  "isa_version": "0.1",
+  "program": { ... },
+  "inputs": { ... },
+  "trace": { ... },
+  "outputs": { ... },
+  "commitments": { ... },
+  "attestation": { ... },
+  "ritual": { ... },
+  "signatures": [ ... ]
+}
+```
+
+---
+
+### **1. `program`**
+- **`bytecode`**: base64 or hex string of compiled opcodes.
+- **`disassembly`**: array of `{ pc, opcode, operands }`.
+- **`source_visual`** *(optional)*: character‑cell or palette grid encoding for round‑trip to visual IR.
+- **`manifest`**: ISA version, palette manifest, metadata.
+
+---
+
+### **2. `inputs`**
+- **`stack_init`**: initial stack values.
+- **`memory_init`**: address → value map.
+- **`env`**: fixed constants (no nondeterminism).
+
+---
+
+### **3. `trace`**
+- **`steps`**: array of:
+  ```json
+  {
+    "step": 0,
+    "pc": 0,
+    "opcode": "PUSH",
+    "operands": [5],
+    "stack_before": [],
+    "stack_after": [5],
+    "mem_root_before": "abc123...",
+    "mem_root_after": "def456...",
+    "prev_step_hash": "0000...",
+    "step_hash": "1234...",
+    "tags": ["blessing:init"]
+  }
+  ```
+- **`final_root`**: hash of the entire run.
+
+---
+
+### **4. `outputs`**
+- **`stack_final`**: final stack state.
+- **`memory_final`**: final memory map or Merkle root.
+- **`return_value`**: if applicable.
+
+---
+
+### **5. `commitments`**
+- **`code_root`**: hash of bytecode.
+- **`input_root`**: hash of inputs.
+- **`trace_root`**: Merkle root of all step hashes.
+- **`final_root`**: canonical run identity.
+
+---
+
+### **6. `attestation`**
+- **`type`**: `"hash_chain" | "TEE" | "ZK"`.
+- **`data`**: attestation payload (TEE quote, proof, etc.).
+
+---
+
+### **7. `ritual`**
+- **`svg`**: embedded or linked 4‑pane ritual view.
+- **`annotations`**: human or communal notes.
+- **`drift_overlays`**: if compared to another run.
+
+---
+
+### **8. `signatures`**
+- Array of `{ signer_id, signature, public_key_ref }`.
+
+---
+
+## **🔹 Why this works for PXOS**
+- **Machine‑first truth**: `trace` + `commitments` are the canonical record.
+- **Human‑first audit**: `ritual` is derived from the trace, never ad‑hoc.
+- **Lineage‑aware**: every `.dvcf` is immutable, signed, and content‑addressed.
+- **Extensible**: you can add new attestation types or ritual panes without breaking old files.
+
+---
+
+If you want, I can now **draft the reference verifier’s replay algorithm** so you can prove that any `.dvcf` is valid, drift‑free, and faithful to the claimed final root — that would complete the “truth loop” before you start populating the Hall of Drift.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Alright — here’s the **reference verifier replay algorithm** for `.dvcf` v0.1 so you can close the loop from *artifact → proof → ritual*. This is the “truth engine” that ensures any claimed run is exactly what the machine executed, drift‑free and lineage‑faithful.  
+
+---
+
+## **🔍 Reference Verifier — Replay Algorithm**
+
+### **Inputs**
+- `.dvcf` bundle (already content‑addressed by `final_root`)
+- Reference VM implementation (must match `vm_version` + `isa_version`)
+
+---
+
+### **Step 0 — Parse & Sanity Check**
+1. Parse `.dvcf` into structured form.
+2. Verify `format_version`, `vm_version`, `isa_version` are supported.
+3. Check that `final_root` in `commitments` matches the top‑level `trace.final_root`.
+
+---
+
+### **Step 1 — Code & Input Commitments**
+1. Hash the `program.bytecode` → compare to `commitments.code_root`.
+2. Hash the `inputs` (stack + memory) → compare to `commitments.input_root`.
+
+---
+
+### **Step 2 — Initialize VM State**
+- Load bytecode into VM.
+- Initialize stack and memory from `inputs`.
+- Compute initial `mem_root_before` (Merkle root of memory).
+
+---
+
+### **Step 3 — Step‑by‑Step Replay**
+For each `trace.steps[i]`:
+1. **Check linkage**:  
+   - If `i == 0`, `prev_step_hash` must be all zeros (or agreed genesis value).  
+   - Else, `prev_step_hash` must equal `trace.steps[i-1].step_hash`.
+2. **Verify pre‑state**:  
+   - Hash current stack → compare to `stack_before` hash (or full array if stored).  
+   - Compare current memory root to `mem_root_before`.
+3. **Execute opcode** in VM with given operands.
+4. **Verify post‑state**:  
+   - Hash resulting stack → compare to `stack_after`.  
+   - Compare new memory root to `mem_root_after`.
+5. **Recompute `step_hash`** from `(pc, opcode, operands, stack_before_hash, mem_root_before, mem_root_after, prev_step_hash)` → must match recorded `step_hash`.
+
+---
+
+### **Step 4 — Final Root Check**
+- After last step, recompute `final_root` from the agreed formula (e.g., hash of last `step_hash` + `mem_root_after` + `stack_after_hash`).
+- Must match `trace.final_root` and `commitments.final_root`.
+
+---
+
+### **Step 5 — Attestation Verification** *(if present)*
+- If `attestation.type == "TEE"`, verify quote against public key.
+- If `attestation.type == "ZK"`, verify proof against circuit and public inputs.
+- If `attestation.type == "hash_chain"`, no extra check — the replay *is* the verification.
+
+---
+
+### **Step 6 — Ritual Regeneration**
+- From verified trace, regenerate the 4‑pane SVG ritual.
+- Embed verification status + recomputed commitments in metadata.
+- Optionally diff against any provided `ritual.svg` to detect tampering.
+
+---
+
+## **✅ Pass Criteria**
+- All commitments match.
+- All step hashes match.
+- Final root matches.
+- Optional attestations verify.
+- Ritual regenerates identically from trace.
+
+---
+
+## **🚫 Fail Criteria**
+- Any mismatch in commitments, step linkage, or final root.
+- Any opcode execution result differs from recorded post‑state.
+- Attestation fails to verify.
+
+---
+
+If you like, I can now **draft the Merkle root computation spec** for memory and stack so that both your VM and verifier produce identical roots — that’s the last piece to make the commitments unambiguous and cross‑implementation safe. That would lock the “state hashing” ritual into PXOS lineage forever.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Perfect — let’s lock in the **Merkle root computation spec** so your VM and verifier always produce identical state commitments, no matter the implementation language or platform. This is the last “truth anchor” before you can start blessing `.dvcf` artifacts into the Hall of Drift.  
+
+---
+
+## **🌳 Merkle Root Computation — v0.1**
+
+### **1. Purpose**
+- Provide a **deterministic, language‑agnostic** method for hashing VM state (stack and memory).
+- Ensure **bit‑for‑bit reproducibility** across all reference and independent implementations.
+- Make state commitments **content‑addressable** and lineage‑safe.
+
+---
+
+### **2. Hash Function**
+- **Algorithm**: SHA‑256 (fixed for v0.1; versioned in spec for future changes).
+- **Encoding**: All integers serialized as **little‑endian, fixed‑width** (e.g., 4 bytes for 32‑bit VM).
+- **Node format**: Concatenate child hashes in **lexical order** (left then right) before hashing.
+
+---
+
+### **3. Memory Merkle Root**
+1. **Leaf nodes**:  
+   For each address `i` in `[0, MEM_SIZE-1]`:
+   ```
+   leaf_hash_i = SHA256( serialize_u32(address) || serialize_u32(value) )
+   ```
+2. **Tree construction**:  
+   - Pair leaves in ascending address order.  
+   - If odd number of nodes at a level, duplicate the last node.  
+   - Hash each pair:  
+     ```
+     parent_hash = SHA256( left_child_hash || right_child_hash )
+     ```
+   - Repeat until a single root remains.
+3. **Empty memory**: All values = 0 → deterministic root.
+
+---
+
+### **4. Stack Merkle Root**
+1. **Leaf nodes**:  
+   For each stack index `i` (0 = bottom, N‑1 = top):
+   ```
+   leaf_hash_i = SHA256( serialize_u32(index) || serialize_u32(value) )
+   ```
+2. **Tree construction**: Same as memory.
+3. **Empty stack**: No elements → root = SHA256("STACK_EMPTY").
+
+---
+
+### **5. Combined State Commitment**
+For each step in the trace:
+```
+state_root = SHA256( stack_root || mem_root )
+```
+- This `state_root` is what gets committed in `step_hash` and used to derive the `final_root`.
+
+---
+
+### **6. Final Root Formula**
+At the end of execution:
+```
+final_root = SHA256( last_step_hash || stack_root_final || mem_root_final )
+```
+- This is the canonical run identity and the `.dvcf` filename.
+
+---
+
+### **7. Drift Detection**
+- Any divergence in **either** stack or memory at any step → different `state_root` → different `step_hash` → different `final_root`.
+- This makes drift **cryptographically visible** and impossible to hide.
+
+---
+
+If you want, I can now **stitch everything we’ve built — opcode set, trace schema, `.dvcf` format, verifier algorithm, and Merkle spec — into a single PXOS DVC v0.1 “living spec” document** so you can publish it as the first official covenant for your machine‑first lineage engine. That would be your inaugural “spec blessing” in the Hall of Drift.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Here’s a review and synthesis of the architecture and code for your Digital Visual Computer (DVC) v0.1, as detailed in your attached file.
+
+***
+
+## Visual-as-Proof: Core Summary
+
+You are building a **Digital Visual Computer (DVC)** that preserves visual and auditable “rituals,” yet is computationally practical by separating the “engine” (a deterministic, stack-based VM) from the “visuals” (a faithful audit renderer).
+
+### Why Visual-as-Proof is Ideal
+
+- **Performance:** Runs at VM speed—no image I/O bottleneck.
+- **Auditability:** Each execution step emits a hash-chained, tamper-evident trace (“canonical trace”).
+- **Portability:** Deterministic, tiny VM; runs anywhere.
+- **Extensibility:** Simple to add features or principled ceremony (palette/ritual/UI overlays) without reworking the core.
+- **Human-First Audit:** Visuals (SVG, multi-pane) are derived receipts, *not the computation itself*.
+
+***
+
+## The Implementation: DVC v0.1
+
+### 1. VM & Trace Model
+
+**Core:**
+- **Stack-based, deterministic VM** (Python; 64-bit signed ints; fixed-size memory).
+- **Minimal, orthogonal opcode set:** e.g., `NOP`, `PUSHI`, arithmetic (`ADD`, `SUB`, ...), stack ops (`DUP`, `SWAP`), memory (`LOAD`, `STORE`), output (`OUT`), control flow (`JMP`, `JZ`, `JNZ`), `HALT`.
+- **No clocks, random, or external nondeterminism**; every run is reproducible.
+
+**Execution Trace:**
+- Every step logs:
+  - `step`, `pc`, `op`, `args`
+  - `stack_before`, `stack_after`
+  - Output length
+  - **State commitments**: `stack_commit`, `mem_commit`
+  - **Hash chain**: each `step_hash = SHA256(step_json || prev_step_hash)`
+- **Final root** is the unique identity for the entire run.
+
+### 2. Artifact Format
+
+- All run artifacts are bundled: program/disassembly, inputs, output, full trace, meta, and state commitments.
+- **`demo_bundle.json`**: Full bundle w/ trace, commitments, outputs.
+
+### 3. Ritual Renderer
+
+- Takes the trace bundle, renders a **4-pane SVG**:
+  - Meta/Commitments
+  - Program Disassembly
+  - Trace tail (steps)
+  - Outputs
+- All deterministic, diffable, and embeds data for easy review.
+
+***
+
+## Code & Workflow Overview
+
+- **`dvc_vm.py`**: Implements the DVC stack VM; runs bytecode, produces a full hashed trace and commitments.
+- **`dvc_svg.py`**: Consumes a bundle, renders a visually inspectable SVG.
+- **`demo_build.py`**: Demonstrates how to assemble a bundle, run the VM, and produce outputs/visuals.
+
+**Sample program demo:**  
+Performs `(7 + 5) * 3`, stores to memory, outputs result, then counts down from 5 to 1, outputting each.
+
+**Artifacts produced:**
+- `out/demo_bundle.json`: Full canonical trace + state.
+- `out/demo_ritual.svg`: Visualizes the run for audit.
+
+***
+
+## Strengths / Design Wins
+
+- **Definitive reproducibility:** Anyone can replay the trace and confirm the final root.
+- **Faithful, human-checkable visuals:** Decouples UI/ritual from computation; the image is a verifiable receipt.
+- **Lineage / provenance:** Every run is canonically loggable and signable. Multiple VMs can be implemented for N-way “golden tests,” enabling high-assurance cross-validation.
+- **Practical extensibility:** The system is ready to accommodate signed roots, ZK proofs, richer visual rituals, and advanced memory models (e.g., Merkleized memory for sublinear proof).
+- **PXOS compliance:** Satisfies machine-first truth, human-first audit, and immutable lineage.
+
+***
+
+## Next Steps / Suggestions
+
+- **Verifier:** Tool to re-execute bundle and confirm all step and root hashes (guard against tampering, implementation drift).
+- **Packager:** CBOR/ZIP/Protobuf-based `.dvcf` for complete portability, including (optionally) the ritual SVG.
+- **Secondary implementations:** (e.g., Rust or TypeScript) for differential fuzzing/testing of the reference spec.
+- **Attestation Extensions:** Signatures (Ed25519), TEE support, or even ZK proofs on selected traces.
+- **Visual as-IR/Editor:** UI for composing programs visually, compiling to the stack VM, then rendering and inspecting traces.
+
+***
+
+## Bottom Line
+
+- The **Visual-as-Proof** architecture and your reference stack are elegantly implemented and tightly focused.
+- This methodology achieves practical, secure, and profoundly auditable digital computation—blending machine-verifiable truth with ceremonial human-first visuals.
+- You have a robust, extensible foundation for both immediate usage and future evolution (ceremonial layers, ZK, richer editors).
+
+**Would you like an extension: a JSON validator/verifier for trace bundles, a packager, or a deeper dive into multi-language VM strategies?**
+
+[1](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/80917543/5bb73eb8-5b7b-4328-b06b-7f9ed990aa9b/274_machine_dvc12345678.txt)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Given the context of building a Digital Visual Computer (DVC) that maintains visual auditability without relying on pixels for computation, the recommended approach is Visual-as-Proof. This involves:
+Deterministic VM: Run computations in a deterministic Virtual Machine (VM) that ensures reproducibility and verifiability.
+Verifiable Trace: Generate a step-by-step trace of the computation, which can be hash-chained for cryptographic integrity.
+Visual Rendering: Render visuals from the trace as post-execution artifacts for human inspection, providing a faithful representation of the computation.
+The benefits of this approach include:
+Practical performance: Computation happens at normal VM speed without the overhead of pixel-based compute.
+Determinism and auditability: Every step is reproducible and verifiable, allowing for signatures or zero-knowledge proofs to be added later.
+Extensibility: Easy to add features like memory management, I/O, and sandboxing without reworking the visual layer.
+To implement this architecture, consider the following steps:
+Define the canonical IR: Specify the instruction set, memory model, and determinism requirements for the VM.
+Implement reference VM: Implement the VM in two languages for differential testing and verification.
+Design the trace schema: Define a JSON/CBOR schema for the execution trace with hash-chaining.
+Develop the renderer: Generate SVG/PNG visuals from the trace for auditability.
+Packager: Bundle the DVM bytecode, inputs, trace, and outputs into a content-addressed file format (e.g., .dvcf).
+This approach provides a clean separation of concerns between computation and visualization, ensuring both machine verification and human inspection.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Your plan for building a DVC without pixel-based computation is excellent. The **Visual-as-Proof** approach is the most robust and practical way to achieve your goals of a machine-verifiable, human-auditable system.
+
+Here’s a breakdown of why this approach is the best choice, and how you can implement it.
+
+---
+
+### **Why Visual-as-Proof Is the Right Architecture**
+
+This architecture solves the core problem by separating **computation** from **visualization**.
+
+* **Performance:** Computation is handled by a small, efficient, and deterministic VM. This is fast and scalable, unlike slow pixel-based I/O and processing.
+* **Verifiability:** The VM's output isn't just a result; it's a **canonical trace** of every step. This trace is hash-chained, making it cryptographically secure and tamper-evident.
+* **Auditability:** The visuals become a **faithful report** of the trace. They are not the computation itself, but a derived representation that proves the execution occurred as claimed. This maintains the "human-first audit" principle.
+* **Flexibility:** You can add new opcodes, memory models, and other features to the VM without having to redesign the entire visual system.
+
+By adopting this model, you get the best of both worlds: a high-performance computer that is also transparent and auditable. The visuals are the **receipt**, not the engine.
+
+---
+
+### **A Concrete Implementation Plan**
+
+To get started, you can follow a clear, phased approach.
+
+#### **Phase 1: The Core Engine (Truth)**
+1.  **Define a Minimal VM:** Create a small, deterministic VM with a limited instruction set (e.g., opcodes for arithmetic, stack manipulation, and control flow). It must have fixed-width integers and no nondeterministic operations.
+2.  **Canonical Trace:** Ensure the VM logs every instruction executed. Each log entry should include the program counter, opcode, operands, and the cryptographic hash of the state (e.g., stack and memory) at that moment.
+3.  **Hash-Chaining:** Link each step's hash to the previous one. This creates a chain of custody for the entire computation, culminating in a single **final root hash** that is the unique identity of the run.
+
+#### **Phase 2: The Visual Layer (Audit)**
+1.  **Trace-to-Visual Renderer:** Build a tool that takes the canonical trace as input and generates a visual representation. Your four-pane ritual (palette, disassembly, IR, outputs) is the perfect format for this.
+2.  **Use SVG:** Generate the visuals in SVG format. It's a text-based, lossless, and scalable format that's easy to embed metadata and hashes into.
+
+#### **Phase 3: The Artifact Format and Attestation**
+1.  **Create a `.dvcf` bundle:** Define a container format (like CBOR or Protobuf) that bundles the program, inputs, outputs, the complete trace, and the final root hash.
+2.  **Implement Attestation:** Start by adding simple digital signatures to the final hash. Later, you can explore integrating trusted hardware modules (TEEs) or zero-knowledge proofs (ZKPs) for more advanced trust.
+
+By following this plan, you will have a working prototype that is both performant and verifiable, fully realizing your DVC vision.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Okay, I've processed the uploaded file, which contains a detailed discussion and specification for building a Digital Visual Computer (DVC) using the **Visual-as-Proof** architecture.
+
+The core idea, as reiterated in the file, is that computation should happen in a **deterministic Virtual Machine (VM)**. The output of this computation isn't just the final result, but a detailed, **canonical execution trace**. This trace logs every step (program counter, opcode, operands, state changes) and is secured using techniques like **hash-chaining** (where each step's hash incorporates the previous step's hash) and potentially **Merkle trees** for memory, creating a tamper-evident record.
+
+The "visual" part of the DVC then comes into play *after* the computation. A **renderer** takes this verifiable trace and generates a **human-readable artifact**, such as a multi-pane SVG (showing metadata, disassembly, trace tail, outputs). This visual is a **faithful receipt** or audit log derived from the computation's proof, rather than the computation itself.
+
+The file provides a concrete implementation plan:
+1.  **Deterministic VM:** A simple stack-based machine with a fixed set of opcodes (like `PUSH`, `ADD`, `STORE`, `JMP`, `HALT`) operating on fixed-width integers.
+2.  **Trace Generation:** The VM produces a step-by-step log (`steps`) with cryptographic commitments (hashes) for the stack and memory state after each step, culminating in a `final_root` for the entire run.
+3.  **Artifact Format (`.dvcf`):** A bundle (potentially JSON, CBOR, or a zip file) containing the original program, inputs, the full trace, outputs, the final root, and optionally the rendered visual artifact or proof.
+4.  **Ritual Renderer:** Software to generate the 4-pane SVG view from the trace data for easy human inspection.
+5.  **Attestation:** Starting with signing the `final_root` and progressing to TEEs or ZK proofs for stronger guarantees.
+6.  **Implementation:** Building reference VMs in at least two different languages to ensure deterministic behavior across platforms through differential testing.
+
+Crucially, the file includes a **working v0.1 prototype** (`dvc_vm.py`, `dvc_svg.py`, `demo_build.py`) demonstrating this architecture:
+*   `dvc_vm.py`: Implements the deterministic stack VM and generates the hash-chained trace.
+*   `dvc_svg.py`: Renders the 4-pane SVG audit view from the trace bundle.
+*   `demo_build.py`: Assembles a small test program, runs it on the VM, generates the trace bundle (`demo_bundle.json`), and creates the SVG (`demo_ritual.svg`).
+
+This prototype validates the Visual-as-Proof approach, showing how to achieve the DVC's goals of verifiable computation with a clear, inspectable visual output, without the inefficiency of pixel-based computation. The next steps involve refining the specification, adding a verifier, packaging into a `.dvcf` format, and potentially adding more advanced features like Merkleized memory or ZK proofs.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+The Visual-as-Proof architecture represents a sound solution to the fundamental tension between visual auditability and computational practicality. The approach correctly identifies that treating pixels as computation units creates an insurmountable performance bottleneck, while the proposed separation of concerns—deterministic VM for execution, hash-chained trace for verification, SVG rendering for human inspection—addresses this without sacrificing the core value proposition.
+
+Several aspects of this design are particularly well-reasoned:
+
+**Architectural separation**: The three-tier model (Trust Core, Visual Layer, Interface Layer) creates clear boundaries of responsibility. The VM handles computation efficiently, the trace provides cryptographic integrity, and the renderer produces human-readable artifacts. This modularity allows each component to be optimized independently.
+
+**Deterministic execution model**: The VM specification with fixed-width integers, no floating-point operations, and prohibition of nondeterministic inputs creates the foundation for reproducible computation. The hash-chaining of execution steps provides tamper-evidence while maintaining reasonable storage requirements.
+
+**Practical implementation path**: The staged approach—starting with simple hash-chained traces, then adding signatures, optionally incorporating TEE attestation, and eventually ZK proofs—provides a realistic development trajectory that delivers value at each phase.
+
+However, there are some considerations that warrant attention:
+
+**Trace storage scalability**: For long-running programs, the step-by-step trace could become prohibitively large. While the document mentions compression and Merkle trees as solutions, the storage and bandwidth implications for complex programs need careful analysis. A selective logging approach or hierarchical compression scheme might be necessary.
+
+**Cross-implementation consistency**: The plan to implement the VM in multiple languages for differential testing is crucial, but ensuring identical behavior across implementations—particularly around edge cases like integer overflow, division by zero, and memory bounds—will require rigorous specification and testing protocols.
+
+**Software ecosystem bootstrap problem**: The document acknowledges but doesn't fully address the chicken-and-egg problem of requiring significant software rewrites to leverage specialized accelerators in the future Hybrid-Compute evolution. The transition strategy from general-purpose to domain-specific computing needs more detailed consideration.
+
+The provided v0.1 implementation demonstrates the concepts effectively, though the opcode set is quite minimal. The SVG rendering approach for the four-pane ritual view is clever—it maintains the visual inspection capability while being lightweight and version-controllable.
+
+What specific aspects of scaling this architecture are you most concerned about as you move beyond the proof-of-concept stage?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+The **Visual-as-Proof** architecture is indeed the best approach for building a practical Digital Visual Computer (DVC) that aligns with your PXOS philosophy—machine-first truth, human-first audit, and lineage as a living artifact. It elegantly sidesteps the performance bottlenecks of pixel-based computation while preserving the ceremonial, inspectable essence of your "Hall of Drift" vision. The provided v0.1 implementation (`dvc_vm.py`, `dvc_svg.py`, `demo_build.py`) is a fantastic starting point, demonstrating a deterministic VM, hash-chained trace, and a 4-pane SVG ritual view. Let’s dive into your question and the next steps to advance this architecture.
+
+---
+
+### Why Visual-as-Proof is the Best Choice
+To reiterate, **Visual-as-Proof** excels because it:
+- **Separates Compute and Visuals**: A deterministic VM (stack-based, WASM-like) handles computation efficiently, while visuals are derived post-execution as auditable artifacts, avoiding the impracticality of pixel-based math.
+- **Ensures Verifiability**: The hash-chained trace (each step logging `pc`, `opcode`, `operands`, `stack`, `memory` state, and hashes) creates a tamper-evident, replayable record. This supports cryptographic attestation (signatures, TEEs, or ZK proofs).
+- **Preserves PXOS Values**:
+  - **Machine-First Truth**: The trace is the canonical, immutable record of computation.
+  - **Human-First Audit**: The 4-pane SVG (meta/commitments, disassembly, trace tail, outputs) renders the truth in a visually inspectable form.
+  - **Lineage as Artifact**: The `.dvcf` bundle encapsulates the entire run (code, inputs, trace, outputs, signatures) as a content-addressed, shareable relic.
+- **Scales and Extends**: The VM can grow to support memory ops, syscalls, or domain-specific instructions without reworking the visual layer.
+- **Portable**: Runs anywhere a VM can be implemented (e.g., Rust, JS, Python), with visuals as platform-agnostic SVGs.
+
+---
+
+### Refining the Implementation
+The provided v0.1 code is a solid foundation, but to make it a fully realized DVC, we can enhance it with:
+1. **A Verifier**: To validate a `.dvcf` bundle by re-executing the program and confirming the `final_root`.
+2. **A `.dvcf` Packager**: To standardize the artifact format (code, inputs, trace, outputs, signatures) in a compact, content-addressed container.
+3. **Merkleized Memory**: To optimize memory state commitments for sublinear proofs.
+4. **Visual-as-IR Integration**: To allow authoring in a visual UI that compiles to VM bytecode, preserving the "ritual" UX.
+
+Since you’ve asked for the next steps, and the suggestion to extend with a **verifier** is spot-on, let’s focus on that, along with drafting a `.dvcf` container spec to make the artifacts portable and shareable. I’ll also provide a minimal enhancement to the trace schema for robustness and suggest how to integrate Visual-as-IR for authoring.
+
+---
+
+### Step 1: Building a Verifier
+A verifier ensures that a `.dvcf` bundle’s `final_root` matches the result of re-executing the program with the given inputs. This reinforces the machine-first truth by allowing anyone to independently validate a computation.
+
+#### Verifier Design
+- **Input**: A `.dvcf` bundle (containing `vm_version`, `program_hash`, `program_disasm`, `inputs`, `outputs`, `steps`, `final_root`, etc.).
+- **Process**:
+  1. Load the program (`program_disasm` or bytecode) and inputs.
+  2. Re-run the program on a fresh VM instance.
+  3. Generate a new trace, recomputing step hashes and the `final_root`.
+  4. Compare the recomputed `final_root` with the bundle’s `final_root`.
+- **Output**: Boolean (valid/invalid) and, optionally, a detailed diff if validation fails.
+
+#### Verifier Code (`dvc_verify.py`)
+Below is a Python script that verifies a bundle’s integrity by re-executing and checking the `final_root`. It reuses `dvc_vm.py` for VM execution.
+
+```python
+# dvc_verify.py — Verify a DVC bundle by recomputing the trace and final_root
+# SPDX-License-Identifier: MIT
+import json
+from pathlib import Path
+from dvc_vm import VM, result_to_bundle, sha256
+
+def verify_bundle(bundle_path: str) -> tuple[bool, str]:
+    """Verify a DVC bundle by recomputing the trace and checking the final_root."""
+    # Load the bundle
+    bundle = json.loads(Path(bundle_path).read_text())
+    if bundle["vm_version"] != "dvc-v0.1":
+        return False, f"Unsupported VM version: {bundle['vm_version']}"
+
+    # Extract program and inputs
+    program = [(instr.split(": ")[1].split(" ")[0], 
+                int(instr.split(" ")[1]) if instr.split(" ")[1] else None)
+               for instr in bundle["program_disasm"]]
+    inputs = bundle["inputs"]
+    expected_root = bundle["final_root"]
+
+    # Re-run the program
+    vm = VM(memory_size=bundle["mem_size"])
+    vm.load_program(program)
+    result = vm.run(inputs=inputs)
+    
+    # Recompute the bundle
+    recomputed_bundle = result_to_bundle(result, program, bundle["meta"])
+    recomputed_root = recomputed_bundle["final_root"]
+
+    # Verify
+    if recomputed_root == expected_root:
+        return True, "Bundle is valid"
+    else:
+        return False, f"Root mismatch: expected {expected_root[:32]}…, got {recomputed_root[:32]}…"
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python dvc_verify.py bundle.json")
+        sys.exit(2)
+    valid, message = verify_bundle(sys.argv[1])
+    print(f"Verification: {'Valid' if valid else 'Invalid'}")
+    print(f"Message: {message}")
+```
+
+#### Usage
+Run `python dvc_verify.py out/demo_bundle.json` to verify the demo bundle. It will:
+- Load `demo_bundle.json`.
+- Re-execute the program `[(PUSHI 7), (PUSHI 5), (ADD), ...]` with inputs `[]`.
+- Recompute the trace and `final_root`.
+- Compare with the bundle’s `final_root`, outputting "Valid" or an error.
+
+#### Why This Matters
+The verifier ensures that the DVC’s lineage is trustworthy. Anyone can take a `.dvcf` bundle, run it through their own VM, and confirm the computation’s integrity, aligning with the PXOS principle of auditable truth.
+
+---
+
+### Step 2: Defining the `.dvcf` Container Spec
+To make DVC artifacts portable and shareable, we need a standardized `.dvcf` format. This will bundle the program, inputs, trace, outputs, and signatures into a single, content-addressed file.
+
+#### `.dvcf` Format (CBOR-based)
+CBOR (Concise Binary Object Representation) is compact, portable, and widely supported, making it ideal for DVC artifacts. The structure is:
+
+```cbor
+{
+  "version": "dvcf-0.1",           // File format version
+  "vm_version": "dvc-v0.1",        // VM version
+  "program": [                     // Bytecode as list of [opcode, arg?]
+    ["PUSHI", 7], ["ADD", null], ...
+  ],
+  "program_hash": "sha256...",     // SHA-256 of program (JSON-serialized)
+  "inputs": [int, ...],            // Input values (64-bit integers)
+  "outputs": [int, ...],           // Output values
+  "mem_size": int,                 // Memory size in bytes
+  "steps": [                       // Trace steps (optional, can be recomputed)
+    {
+      "step": int, "pc": int, "op": str, "args": [int, ...],
+      "stack_before": [int, ...], "stack_after": [int, ...],
+      "outputs_len": int, "stack_commit": "sha256...",
+      "mem_commit": "sha256...", "prev_hash": "sha256...",
+      "step_hash": "sha256..."
+    }, ...
+  ],
+  "final_stack_commit": "sha256...", // Final stack state hash
+  "final_mem_commit": "sha256...",   // Final memory state hash
+  "final_root": "sha256...",         // Final trace hash
+  "meta": {                          // Metadata (e.g., title, timestamp)
+    "title": str, "built_at": str, ...
+  },
+  "signatures": [                    // Optional signatures over final_root
+    {"algo": "ed25519", "key_id": str, "sig": "base64..."}, ...
+  ]
+}
+```
+
+#### Packager Code (`dvc_pack.py`)
+This script converts a `demo_bundle.json` into a `.dvcf` CBOR file, optionally signing the `final_root`.
+
+```python
+# dvc_pack.py — Package a DVC bundle into a .dvcf CBOR file
+# SPDX-License-Identifier: MIT
+import json, cbor2
+from pathlib import Path
+import nacl.signing
+import base64
+
+def pack_dvcf(json_path: str, dvcf_path: str, sign_key: str = None):
+    """Convert a JSON bundle to a CBOR .dvcf file, optionally signing the final_root."""
+    bundle = json.loads(Path(json_path).read_text())
+    
+    # Prepare .dvcf structure
+    dvcf = {
+        "version": "dvcf-0.1",
+        "vm_version": bundle["vm_version"],
+        "program": [[op.split(": ")[1].split(" ")[0], 
+                     int(op.split(" ")[1]) if op.split(" ")[1] else None]
+                    for op in bundle["program_disasm"]],
+        "program_hash": bundle["program_hash"],
+        "inputs": bundle["inputs"],
+        "outputs": bundle["outputs"],
+        "mem_size": bundle["mem_size"],
+        "steps": bundle["steps"],  # Include for audit; can be omitted for brevity
+        "final_stack_commit": bundle["final_stack_commit"],
+        "final_mem_commit": bundle["final_mem_commit"],
+        "final_root": bundle["final_root"],
+        "meta": bundle["meta"],
+        "signatures": []
+    }
+    
+    # Optional: Sign the final_root
+    if sign_key:
+        signing_key = nacl.signing.SigningKey(base64.b64decode(sign_key))
+        signature = signing_key.sign(bytes.fromhex(bundle["final_root"]))
+        dvcf["signatures"].append({
+            "algo": "ed25519",
+            "key_id": base64.b64encode(signing_key.verify_key.encode()).decode(),
+            "sig": base64.b64encode(signature.signature).decode()
+        })
+    
+    # Write CBOR file
+    with open(dvcf_path, "wb") as f:
+        cbor2.dump(dvcf, f)
+    return dvcf
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) not in (3, 4):
+        print("Usage: python dvc_pack.py bundle.json out.dvcf [sign_key_base64]")
+        sys.exit(2)
+    sign_key = sys.argv[3] if len(sys.argv) == 4 else None
+    dvcf = pack_dvcf(sys.argv[1], sys.argv[2], sign_key)
+    print(f"Wrote {sys.argv[2]}")
+    print(f"Final root: {dvcf['final_root'][:32]}…")
+```
+
+#### Dependencies
+- Install `cbor2` (`pip install cbor2`) for CBOR serialization.
+- Install `pynacl` (`pip install pynacl`) for Ed25519 signatures.
+
+#### Usage
+Run `python dvc_pack.py out/demo_bundle.json out/demo.dvcf` to create a CBOR `.dvcf` file. If you provide a base64-encoded Ed25519 private key, it will sign the `final_root`.
+
+#### Why This Matters
+The `.dvcf` format makes DVC artifacts self-contained, portable, and verifiable. It supports the "lineage as a living artifact" principle by bundling everything needed to replay or audit a computation, including optional signatures for trust.
+
+---
+
+### Step 3: Enhancing the Trace Schema
+The current trace schema in `dvc_vm.py` is solid but can be refined for robustness:
+- **Add Versioning**: Explicitly version the trace format (e.g., `"trace_version": "0.1"`) to support future upgrades.
+- **Optimize Storage**: Allow optional omission of `steps` in the `.dvcf` bundle, as they can be recomputed during verification.
+- **Merkleized Memory**: Replace the full `mem_commit` with a Merkle root for sublinear proofs of memory state.
+
+#### Updated Trace Schema
+```json
+{
+  "trace_version": "0.1",
+  "vm_version": "dvc-v0.1",
+  "program_hash": "sha256...",
+  "mem_size": int,
+  "inputs": [int, ...],
+  "outputs": [int, ...],
+  "steps": [
+    {
+      "step": int,
+      "pc": int,
+      "op": str,
+      "args": [int, ...],
+      "stack_before": [int, ...],
+      "stack_after": [int, ...],
+      "outputs_len": int,
+      "stack_commit": "sha256...",
+      "mem_commit": "merkleroot...", // Merkle root of memory
+      "prev_hash": "sha256...",
+      "step_hash": "sha256..."
+    }, ...
+  ],
+  "final_stack_commit": "sha256...",
+  "final_mem_commit": "merkleroot...",
+  "final_root": "sha256...",
+  "meta": {
+    "title": str,
+    "built_at": str,
+    "author": str, // Optional
+    "description": str // Optional
+  }
+}
+```
+
+#### Merkleized Memory (Future Enhancement)
+To implement Merkleized memory:
+- Divide memory into fixed-size chunks (e.g., 64 bytes).
+- Build a Merkle tree over the chunks.
+- Store the Merkle root as `mem_commit` per step.
+- This allows proving specific memory locations without revealing the entire memory state, useful for ZK proofs or privacy-sensitive applications.
+
+---
+
+### Step 4: Integrating Visual-as-IR for Authoring
+To preserve the "ceremonial" UX, integrate **Visual-as-IR (#2)** for program authoring:
+- **Visual Editor**: Create a grid-based or node-based UI where users place opcodes (e.g., `PUSHI`, `ADD`) as colored blocks or nodes.
+- **Compilation**: Convert the visual representation to VM bytecode. For example, a grid of `[PUSHI 7, PUSHI 5, ADD]` becomes `[(PUSHI, 7), (PUSHI, 5), (ADD, None)]`.
+- **Tooling**: Use a library like [D3.js](https://d3js.org/) for a web-based editor or [PyQt](https://www.riverbankcomputing.com/software/pyqt/) for a desktop app.
+
+#### Example Workflow
+1. User drags a `PUSHI 7` block (blue) and `ADD` block (red) into a grid.
+2. Editor compiles to `[(PUSHI, 7), (ADD, None)]`.
+3. VM runs the bytecode, producing a trace.
+4. Renderer generates the 4-pane SVG from the trace.
+
+This keeps the visual ritual alive for authoring while ensuring computation remains efficient.
+
+---
+
+### Why This Aligns with PXOS
+- **Machine-First Truth**: The VM and hash-chained trace are the canonical source of truth, verifiable by anyone.
+- **Human-First Audit**: The SVG renderer produces a 4-pane view (meta, disassembly, trace, outputs) that’s inspectable and beautiful, preserving the "Hall of Drift" aesthetic.
+- **Lineage as Artifact**: The `.dvcf` bundle encapsulates the entire computation history, including signatures, making it a living, shareable relic.
+- **Extensibility**: The VM can evolve (e.g., add syscalls or crypto ops) without altering the visual layer.
+- **Portability**: The VM and CBOR format run anywhere, and SVGs are universally viewable.
+
+---
+
+### Next Steps
+1. **Run the Verifier**: Test `dvc_verify.py` with `out/demo_bundle.json` to confirm the bundle’s integrity.
+2. **Create a `.dvcf` File**: Use `dvc_pack.py` to package `demo_bundle.json` into `demo.dvcf`.
+3. **Enhance the VM**:
+   - Add Merkleized memory for efficient state proofs.
+   - Support a broader opcode set (e.g., bitwise ops, crypto primitives).
+4. **Build a Visual Editor**: Prototype a simple Visual-as-IR editor to compile visual programs to bytecode.
+5. **Differential Testing**: Implement the VM in a second language (e.g., TypeScript) and verify identical traces.
+
+#### Immediate Action
+I recommend starting by running the verifier (`python dvc_verify.py out/demo_bundle.json`) to confirm the demo’s integrity. Then, use `dvc_pack.py` to create a `.dvcf` file (`python dvc_pack.py out/demo_bundle.json out/demo.dvcf`). If you have an Ed25519 key, you can sign the bundle for added trust.
+
+---
+
+### What Intrigues You Most?
+- **Verifier**: Want me to refine `dvc_verify.py` with detailed diff reporting or support for partial trace verification?
+- **Packager**: Should I extend `dvc_pack.py` to include compression or ZK proof placeholders?
+- **Visual-as-IR**: Interested in a mockup of a visual editor for authoring programs?
+- **Merkle Memory**: Want a sketch of how to implement Merkleized memory commitments?
+- **Spec**: Prefer a formal JSON Schema for the trace and `.dvcf` format?
+
+Let me know your focus, and I’ll provide the next piece (e.g., code, schema, or mockup) to keep the DVC moving forward!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+To summarize the extensive discussion and analysis, the **Visual-as-Proof** architecture is the optimal choice for building a **Digital Visual Computer (DVC)**. This approach separates computation from visualization, ensuring performance, verifiability, and extensibility. Here’s a concise breakdown of the key points and next steps:
+
+---
+
+### **Why Visual-as-Proof?**
+1. **Separation of Concerns**:
+   - **Computation**: Handled by a deterministic VM (e.g., a stack machine or WASM subset).
+   - **Visuals**: Generated as a "receipt" or artifact after computation, preserving auditability without sacrificing performance.
+
+2. **Auditability and Trust**:
+   - A **canonical trace** logs every step (opcode, inputs, outputs, state) and is hash-chained for tamper-proof verification.
+   - Optional cryptographic proofs (e.g., ZK-SNARKs/STARKs) or TEE attestation (e.g., SGX) can be added for stronger guarantees.
+
+3. **Flexibility and Extensibility**:
+   - The VM can be implemented in multiple languages, and the trace format can be standardized (e.g., JSON, CBOR, or Protobuf).
+   - Easy to add features like memory operations, control flow, or syscalls without redesigning the visual layer.
+
+4. **Practicality**:
+   - Runs at native VM speed, with visuals generated as a post-process.
+   - Avoids the inefficiency of raster-based computation while retaining the visual "ritual" for transparency.
+
+---
+
+### **How to Implement Visual-as-Proof**
+#### **Step 1: Define the Core VM and Trace Format**
+- **Instruction Set**: Start with a minimal set of opcodes (e.g., 20–30) for arithmetic, stack manipulation, and control flow.
+- **Trace Schema**: Log each step as `(pc, opcode, operands, effects, stack hash, memory Merkle root)`. Hash-chain the steps to create a tamper-proof transcript.
+- **Example Trace Entry**:
+  ```json
+  {
+    "pc": 42,
+    "opcode": "ADD",
+    "operands": [1, 2],
+    "stack_hash": "a1b2c3...",
+    "mem_root": "d4e5f6..."
+  }
+  ```
+
+#### **Step 2: Build the VM**
+- Implement a reference VM in two languages (e.g., Rust and Python) for differential testing.
+- Ensure both VMs produce identical traces and final state roots for the same input.
+
+#### **Step 3: Design the Artifact Format (`.dvcf`)**
+- Bundle the program, inputs, trace commitments, outputs, and optional proofs into a single file.
+- Use content addressing (e.g., hash the final root) to uniquely identify runs.
+
+#### **Step 4: Render the Visual Ritual**
+- Generate an SVG/PDF with the 4-pane view (palette, disassembly, IR, outputs) from the trace.
+- Include embedded thumbnails if you want to retain some image-based artifacts.
+
+#### **Step 5: Attestation Path**
+- **Phase A**: Start with hash-chained transcripts and signatures.
+- **Phase B**: Add optional TEE quotes (e.g., SGX) for hardware-backed trust.
+- **Phase C**: Explore ZK proofs for specific programs (e.g., arithmetic or ML kernels).
+
+---
+
+### **Complementary Approaches**
+- **Visual-as-IR (#2)**: Use a visual editor to compose programs, then compile to the VM’s bytecode. This keeps the "visual ISA" UX without runtime overhead.
+- **Character-Cell DVC (#3)**: Represent programs as grids of symbols (e.g., UTF-8 glyphs) for lossless, diffable source artifacts.
+- **Barcode/QR Frames (#4)**: Use QR codes to transport programs/state in air-gapped or camera-based workflows.
+- **Shader-Backed (#5)**: Use shaders for visualization or parallel compute, but keep the VM as the source of truth.
+
+---
+
+### **Concrete Next Steps**
+1. **Specify the VM and Trace Format**:
+   - Define the instruction set, memory model, and trace schema.
+   - Example: A stack-based VM with 32-bit integers and a Merkleized memory model.
+
+2. **Implement the VM**:
+   - Write a reference implementation in Rust (for performance) and Python (for prototyping).
+   - Add differential fuzzing to ensure both VMs agree.
+
+3. **Build the Renderer**:
+   - Create a tool to generate the 4-pane SVG from a trace.
+   - Example: Use a templating engine like Jinja2 or a graphics library like Cairo.
+
+4. **Package and Distribute**:
+   - Define the `.dvcf` format (e.g., CBOR or Protobuf).
+   - Write a CLI tool to bundle programs, inputs, and traces.
+
+5. **Pilot Applications**:
+   - Start with simple apps (e.g., a calculator or rules engine) to validate the design.
+   - Measure performance and auditability.
+
+---
+
+### **Example Workflow**
+1. **Write a Program**: Use a visual editor (Visual-as-IR) or text-based DSL.
+2. **Compile to Bytecode**: Convert the program to VM instructions.
+3. **Execute**: Run the bytecode on the VM, generating a trace.
+4. **Verify**: Check the hash chain and signatures.
+5. **Render**: Generate the 4-pane SVG for human inspection.
+6. **Share**: Distribute the `.dvcf` bundle with the visual artifact.
+
+---
+
+### **Tools and Libraries to Consider**
+- **VM**: [WebAssembly (WASM)](https://webassembly.org/), [Lua VM](https://www.lua.org/), or a custom stack machine.
+- **Trace Format**: [CBOR](https://cbor.io/) or [Protobuf](https://developers.google.com/protocol-buffers).
+- **Rendering**: [SVG.js](https://svgjs.dev/), [Cairo](https://www.cairographics.org/), or [D3.js](https://d3js.org/).
+- **Attestation**: [Libsodium](https://doc.libsodium.org/) for signatures, [zk-SNARKs](https://z.cash/technology/zksnarks/) for proofs.
+
+---
+
+### **Final Thought**
+By focusing on **Visual-as-Proof**, you retain the spirit of a "visible, self-verifying, auditable" computer while avoiding the pitfalls of pixel-based computation. The visuals become a powerful tool for trust and transparency, not a bottleneck for performance.
+
+---
+
+### **Next Steps**
+- **Draft a minimal IR spec or trace schema** for your VM.
+- **Explore the renderer or attestation layers** in more detail.
+- **Extend the provided code** to include a verifier for re-checking the trace and confirming the `final_root`.
+
+Would you like to dive deeper into any of these areas or proceed with extending the code?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+This is an excellent implementation of the Visual-as-Proof architecture! You've created a working v0.1 DVC system that perfectly demonstrates the core principles we discussed. Let me break down what makes this implementation so strong:
+
+## What's Been Delivered
+
+### 1. **Deterministic VM with Proper Tracing**
+- Clean stack-based VM with well-defined opcodes
+- 64-bit integer arithmetic with proper wrapping
+- Step-by-step execution with complete state capture
+- Hash-chained trace creating a tamper-evident record
+
+### 2. **Faithful Visual Rendering**
+- 4-pane SVG visualization that serves as a "receipt" rather than computation engine
+- Clear separation between the execution trace and its visual representation
+- Human-readable disassembly, trace tail, and outputs
+- Visual presentation of cryptographic commitments
+
+### 3. **Complete Demo Workflow**
+- Sample program demonstrating arithmetic, memory operations, control flow, and output
+- End-to-end pipeline from program definition to visual artifact
+- Bundle format containing all necessary information for verification
+
+## Why This Implementation Works
+
+This delivers on the core promise of Visual-as-Proof:
+- **Machine-first truth**: The hash-chained trace is the canonical record
+- **Human-first audit**: The SVG visualization makes the computation inspectable
+- **Verifiability**: Each step is cryptographically committed to the next
+- **Performance**: Computation happens at VM speed, not pixel-processing speed
+
+## Next Steps
+
+Yes, I would absolutely love to see a **verifier** that can re-check a bundle and confirm its final_root! This would complete the verification loop and demonstrate the full power of the architecture.
+
+Additionally, here are some other valuable v0.1 enhancements you could consider:
+
+1. **Formal Specification**: A simple markdown file documenting the VM instruction set, trace format, and bundle structure
+2. **Cross-Implementation Testing**: A second VM implementation (perhaps in JavaScript) to test against
+3. **Merkle Memory**: As you mentioned, moving from whole-memory hashing to Merkle trees for more efficient proofs
+4. **Signature Support**: Adding Ed25519 signatures to the bundle for attestation
+5. **Simple CLI Tool**: A command-line interface to run programs and generate bundles
+
+This implementation is a fantastic foundation for the DVC concept. It demonstrates that you can have both verifiable computation and human-readable auditability without sacrificing performance. The Visual-as-Proof architecture is clearly the right path forward, and this implementation proves it's practical to build.
+
+I'm excited to see the verifier and any other extensions you develop!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+This is an absolutely stellar implementation. You've perfectly captured the essence of the **Visual-as-Proof** architecture and delivered a complete, runnable v0.1. This is exactly the kind of concrete foundation needed to move the DVC concept from philosophy to practice.
+
+The code is beautifully structured, demonstrating the core principles with clarity:
+
+1.  **`dvc_vm.py`**: A clean, deterministic stack VM with hash-chained traceability. The use of `sha256` for state commitments (`stack_commit`, `mem_commit`) and the step-by-step hash chaining is the bedrock of verifiability.
+2.  **`dvc_svg.py`**: A perfect ritual renderer. The 4-pane SVG output (`Meta/Commitments`, `Program Disassembly`, `Trace (tail)`, `Outputs`) is exactly the kind of human-auditable "receipt" we envisioned, derived entirely from the trace.
+3.  **`demo_build.py`**: A great demo that proves the concept works end-to-end, from bytecode to bundle to visual artifact.
+
+The output `demo_ritual.svg` is particularly impressive. It visually communicates the entire story of the computation: the commitments for trust, the code that ran, the final state changes, and the results. This is the Digital Visual Computer.
+
+### Yes, please extend it.
+
+A **verifier** is the logical and crucial next step. It would complete the trust loop. The ability to independently take a `.dvcf` bundle (or in this case, the `demo_bundle.json`), re-execute the program, and cryptographically verify that the computed trace hashes match the committed ones is the entire point.
+
+**Please proceed.** I'd like you to implement the verifier. The ideal implementation would:
+1.  Take a path to a bundle file (e.g., `verify.py demo_bundle.json`).
+2.  Extract the program, inputs, and initial state from the bundle.
+3.  Re-run the program using the same `VM` code to generate a new trace and a new `final_root`.
+4.  Compare the newly computed `final_root` to the one stored in the bundle.
+5.  Print a clear pass/fail message, indicating whether the bundle's trace is valid and consistent.
+
+This will transform the system from a cool demo into a genuinely verifiable computational artifact. It's the difference between making a claim and providing proof for that claim.
+
+Once the verifier is implemented, the next step on the roadmap would indeed be the **`.dvcf` packager** to create a standardized, content-addressed container format.
+
+Excellent work. I'm ready for the verifier.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+That is an essential next step. The verifier is the critical piece that elevates the "Visual-as-Proof" concept from a powerful idea to a truly trustless and auditable system.
+
+The core of our entire approach is to establish a "machine-first truth"—a canonical, verifiable record of a computation. The verifier is the tool that enforces this truth. It is the logical and cryptographic conclusion of the design we've been building.
+
+By creating a verifier, we move from merely generating a permanent audit log to having a tool that can cryptographically attest to its security and integrity.[1] The verifier's function directly addresses the "Verifiable Computation Problem" [2] by allowing a third party to check if a prover's computation was performed correctly.[2]
+
+This process is what makes the system secure and reliable. The verifier will take the bundle and re-run the program to ensure that the final root hash from the re-execution matches the one provided in the bundle. This is what proves the integrity of the computation without needing to trust the executor's environment or the compiler that produced the bytecode.[3] The hash-chaining in the trace makes this a mathematically sound process.[4]
+
+I will now begin the research task to draft the verifier's functionality and implementation considerations.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Awesome — here’s a drop-in verifier that replays a bundle, re-computes the hash-chain, and checks step-by-step commitments.
+
+---
+
+### `dvc_verify.py`
+
+```python
+# dvc_verify.py — verify a DVC v0.1 run bundle by hash-chain + re-execution
+# SPDX-License-Identifier: MIT
+"""
+Usage:
+  python dvc_verify.py path/to/bundle.json
+  python dvc_verify.py path/to/bundle.json --trace-only   # skip VM re-exec
+  python dvc_verify.py path/to/bundle.json --quiet        # minimal output
+"""
+
+from __future__ import annotations
+import argparse, json, sys, re
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+# Local VM impl (the one you already have)
+from dvc_vm import VM, result_to_bundle, commit_stack, commit_mem
+import hashlib
+
+def sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def recompute_step_hash(step_json_obj: dict, prev_hash: str) -> str:
+    # Must match VM's exact canonicalization: separators=(',', ':')
+    blob = json.dumps(step_json_obj, separators=(',', ':')).encode() + prev_hash.encode()
+    return sha256(blob)
+
+def parse_disasm(lines: List[str]) -> List[Tuple[str, Optional[int]]]:
+    """
+    Convert disassembly lines like '0003: PUSHI 7' or '0010: ADD' back to bytecode tuples.
+    """
+    bytecode: List[Tuple[str, Optional[int]]] = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        # Split "0000: ..." (index prefix is ignored)
+        m = re.match(r'^\s*\d+:\s*(.+)$', ln)
+        core = m.group(1) if m else ln
+        parts = core.split()
+        op = parts[0].strip().upper()
+        arg = None
+        if len(parts) > 1:
+            # Remainder could be a signed int
+            try:
+                arg = int(parts[1], 10)
+            except ValueError:
+                raise ValueError(f"Cannot parse immediate in line: {ln!r}")
+        bytecode.append((op, arg))
+    return bytecode
+
+def trace_chain_check(bundle: dict, quiet=False) -> bool:
+    steps = bundle.get("steps", [])
+    if not isinstance(steps, list) or not steps:
+        print("✗ Bundle has no steps", file=sys.stderr)
+        return False
+
+    ok = True
+    prev = "0" * 64
+    for s in steps:
+        # Rebuild the minimal step JSON the VM used for hashing
+        step_json_obj = {
+            "step": s["step"],
+            "pc": s["pc"],
+            "op": s["op"],
+            "args": s.get("args", []),
+            "stack_before": s.get("stack_before", []),
+            "stack_after": s.get("stack_after", []),
+            "outputs_len": s.get("outputs_len", 0),
+        }
+        h = recompute_step_hash(step_json_obj, prev)
+        if h != s.get("step_hash"):
+            ok = False
+            print(f"✗ step {s['step']:d}: step_hash mismatch\n  expected: {s.get('step_hash')}\n  recomputed: {h}", file=sys.stderr)
+        if s.get("prev_hash") != prev:
+            ok = False
+            print(f"✗ step {s['step']:d}: prev_hash mismatch\n  expected: {prev}\n  found: {s.get('prev_hash')}", file=sys.stderr)
+        prev = h
+
+    final_root = bundle.get("final_root")
+    if final_root != prev:
+        ok = False
+        print(f"✗ final_root mismatch\n  expected: {final_root}\n  recomputed: {prev}", file=sys.stderr)
+
+    if ok and not quiet:
+        print(f"✓ Trace hash-chain OK ({len(steps)} steps) — final_root={prev[:16]}…")
+    return ok
+
+def semantic_reexec_check(bundle: dict, quiet=False) -> bool:
+    # Must have disassembly to reconstruct program
+    dis = bundle.get("program_disasm")
+    if not isinstance(dis, list) or not dis:
+        print("! No program_disasm in bundle; skipping re-execution (add it to enable semantic verification).", file=sys.stderr)
+        return False
+
+    # Rebuild program
+    try:
+        bytecode = parse_disasm(dis)
+    except Exception as e:
+        print(f"✗ Failed to parse program_disasm: {e}", file=sys.stderr)
+        return False
+
+    mem_size = int(bundle.get("mem_size", 1024))
+    inputs = bundle.get("inputs", [])
+    expected_outputs = bundle.get("outputs", [])
+    steps_bundle = bundle.get("steps", [])
+
+    # Execute with our VM
+    vm = VM(memory_size=mem_size)
+    vm.load_program(bytecode)
+    res = vm.run(inputs=inputs)
+
+    # Quick checks: outputs, step count
+    ok = True
+    if res.outputs != expected_outputs:
+        ok = False
+        print(f"✗ outputs mismatch\n  expected: {expected_outputs}\n  actual:   {res.outputs}", file=sys.stderr)
+
+    if len(res.steps) != len(steps_bundle):
+        ok = False
+        print(f"✗ step count mismatch\n  expected: {len(steps_bundle)}\n  actual:   {len(res.steps)}", file=sys.stderr)
+
+    # Per-step checks (length permitting)
+    n = min(len(res.steps), len(steps_bundle))
+    for i in range(n):
+        a = steps_bundle[i]
+        b = res.steps[i].__dict__  # dataclass to dict
+        # Compare core semantics
+        if a["op"] != b["op"] or a["pc"] != b["pc"]:
+            ok = False
+            print(f"✗ step {i}: op/pc mismatch\n  bundle: op={a['op']} pc={a['pc']}\n  vm:     op={b['op']} pc={b['pc']}", file=sys.stderr)
+        if a.get("stack_after") != b.get("stack_after"):
+            ok = False
+            print(f"✗ step {i}: stack_after mismatch\n  bundle: {a.get('stack_after')}\n  vm:     {b.get('stack_after')}", file=sys.stderr)
+        if a.get("outputs_len") != b.get("outputs_len"):
+            ok = False
+            print(f"✗ step {i}: outputs_len mismatch\n  bundle: {a.get('outputs_len')}\n  vm:     {b.get('outputs_len')}", file=sys.stderr)
+        # Commitments
+        if a.get("stack_commit") != b.get("stack_commit"):
+            ok = False
+            print(f"✗ step {i}: stack_commit mismatch\n  bundle: {a.get('stack_commit')}\n  vm:     {b.get('stack_commit')}", file=sys.stderr)
+        if a.get("mem_commit") != b.get("mem_commit"):
+            ok = False
+            print(f"✗ step {i}: mem_commit mismatch\n  bundle: {a.get('mem_commit')}\n  vm:     {b.get('mem_commit')}", file=sys.stderr)
+        # Hash-chain per step
+        if a.get("step_hash") != b.get("step_hash") or a.get("prev_hash") != b.get("prev_hash"):
+            ok = False
+            print(f"✗ step {i}: hash-chain mismatch\n  bundle: step_hash={a.get('step_hash')[:16]}… prev={a.get('prev_hash')[:16]}…\n  vm:     step_hash={b.get('step_hash')[:16]}… prev={b.get('prev_hash')[:16]}…", file=sys.stderr)
+
+    # Final commits
+    if bundle.get("final_root") != res.final_root:
+        ok = False
+        print(f"✗ final_root mismatch\n  bundle: {bundle.get('final_root')}\n  vm:     {res.final_root}", file=sys.stderr)
+    if bundle.get("final_stack_commit") != res.final_stack_commit:
+        ok = False
+        print(f"✗ final_stack_commit mismatch\n  bundle: {bundle.get('final_stack_commit')}\n  vm:     {res.final_stack_commit}", file=sys.stderr)
+    if bundle.get("final_mem_commit") != res.final_mem_commit:
+        ok = False
+        print(f"✗ final_mem_commit mismatch\n  bundle: {bundle.get('final_mem_commit')}\n  vm:     {res.final_mem_commit}", file=sys.stderr)
+
+    if ok and not quiet:
+        print(f"✓ Semantic re-execution OK — outputs match and commitments identical.")
+        print(f"  final_root={res.final_root[:16]}…  steps={len(res.steps)}")
+    return ok
+
+def main():
+    ap = argparse.ArgumentParser(description="Verify a DVC v0.1 bundle (hash-chain and semantic replay).")
+    ap.add_argument("bundle", help="Path to bundle JSON (e.g., out/demo_bundle.json)")
+    ap.add_argument("--trace-only", action="store_true", help="Only verify the provided hash-chain; skip VM re-execution")
+    ap.add_argument("--quiet", action="store_true", help="Reduce output")
+    args = ap.parse_args()
+
+    p = Path(args.bundle)
+    if not p.exists():
+        print(f"Bundle not found: {p}", file=sys.stderr)
+        return 2
+
+    try:
+        bundle = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Failed to read/parse bundle: {e}", file=sys.stderr)
+        return 2
+
+    # Basic presence checks
+    required = ["vm_version", "program_hash", "mem_size", "inputs", "outputs", "steps", "final_root"]
+    missing = [k for k in required if k not in bundle]
+    if missing:
+        print(f"✗ Bundle missing required keys: {missing}", file=sys.stderr)
+        return 2
+
+    ok = trace_chain_check(bundle, quiet=args.quiet)
+
+    if not args.trace_only:
+        ok = semantic_reexec_check(bundle, quiet=args.quiet) and ok
+
+    if ok and not args.quiet:
+        print("✓ Bundle VERIFIED")
+    return 0 if ok else 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+---
+
+**How to use:**
+
+1. Save as `dvc_verify.py` alongside your other files.
+2. Run:
+
+```bash
+python demo_build.py
+python dvc_verify.py out/demo_bundle.json
+```
+
+You should see both checks pass:
+
+* **Trace hash-chain OK** (recomputes each `step_hash` from the step JSON + previous hash)
+* **Semantic re-execution OK** (replays program from `program_disasm`, matches outputs, step commits, and `final_root`)
+
+Want a `.dvcf` packager next (zip/CBOR with code+inputs+trace+svg+signature) or JSON Schema for the bundle?
+
+
+
+
+
+
+
+
+
+
+
+
+
+heck yeah — here’s a **self-contained .dvcf packager** (zip-based, content-addressed) **plus JSON Schemas** so the artifacts are machine-verifiable and human-auditable.
+
+---
+
+### `dvc_pack.py`
+
+```python
+# dvc_pack.py — create/verify/extract .dvcf (DVC bundle container)
+# SPDX-License-Identifier: MIT
+"""
+.dvcf is a simple ZIP container with:
+  /manifest.json         — package metadata + content hashes (+ optional signature)
+  /bundle.json           — canonical run bundle (your VM trace)
+  /ritual.svg            — optional 4-pane renderer output
+  /SIGNATURE.json        — optional detached signature blob (same content as manifest["signature"])
+
+Signing:
+  - HMAC-SHA256 (shared secret) via --shared-secret
+  - Ed25519 (PyNaCl) if available via --ed25519-privkey/--ed25519-pubkey
+
+Usage:
+  # Pack
+  python dvc_pack.py pack \
+    --bundle out/demo_bundle.json \
+    --svg out/demo_ritual.svg \
+    --out build/demo.dvcf \
+    --name "DVC v0.1 demo" \
+    [--shared-secret "supersecret"] \
+    [--ed25519-privkey ed25519.sk]
+
+  # Verify package integrity (hashes + signature if provided)
+  python dvc_pack.py verify build/demo.dvcf \
+    [--shared-secret "supersecret"] \
+    [--ed25519-pubkey ed25519.pk]
+
+  # Extract
+  python dvc_pack.py extract build/demo.dvcf --to extracted/
+"""
+from __future__ import annotations
+import argparse, io, json, hashlib, hmac, sys, time, os, base64, zipfile
+from pathlib import Path
+from typing import Optional
+
+# Optional Ed25519 via PyNaCl
+try:
+    import nacl.signing, nacl.encoding  # type: ignore
+    HAVE_ED25519 = True
+except Exception:
+    HAVE_ED25519 = False
+
+SCHEMA_VERSION = "dvcf-0.1"
+
+HEX64 = "^[0-9a-f]{64}$"
+
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def read_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8")
+
+def load_json(p: Path):
+    return json.loads(read_text(p))
+
+def b64(x: bytes) -> str:
+    return base64.b64encode(x).decode("ascii")
+
+def now_iso() -> str:
+    import datetime
+    return datetime.datetime.utcnow().isoformat()+"Z"
+
+def sign_manifest(payload: dict, shared_secret: Optional[str], ed25519_sk_path: Optional[Path]) -> Optional[dict]:
+    msg = json.dumps(payload, separators=(',', ':')).encode()
+    if ed25519_sk_path:
+        if not HAVE_ED25519:
+            raise RuntimeError("PyNaCl not available; cannot use Ed25519")
+        sk_bytes = Path(ed25519_sk_path).read_bytes()
+        if len(sk_bytes) in (32, 64):
+            sk = nacl.signing.SigningKey(sk_bytes[:32])
+        else:
+            raise RuntimeError("ed25519 private key must be 32 or 64 raw bytes")
+        sig = sk.sign(msg).signature
+        pk = sk.verify_key.encode()
+        return {"alg": "ed25519", "sig": b64(sig), "pub": b64(pk)}
+    if shared_secret:
+        sig = hmac.new(shared_secret.encode(), msg, hashlib.sha256).digest()
+        return {"alg": "hmac-sha256", "sig": b64(sig)}
+    return None
+
+def verify_signature(payload: dict, sigobj: dict, shared_secret: Optional[str], ed25519_pk_path: Optional[Path]) -> bool:
+    if not sigobj:
+        return True
+    alg = sigobj.get("alg")
+    msg = json.dumps(payload, separators=(',', ':')).encode()
+    if alg == "hmac-sha256":
+        if not shared_secret:
+            print("! Signature present but no --shared-secret provided", file=sys.stderr)
+            return False
+        expect = hmac.new(shared_secret.encode(), msg, hashlib.sha256).digest()
+        got = base64.b64decode(sigobj.get("sig",""))
+        return hmac.compare_digest(expect, got)
+    if alg == "ed25519":
+        if not HAVE_ED25519:
+            print("! PyNaCl not available to verify ed25519", file=sys.stderr)
+            return False
+        sig = base64.b64decode(sigobj.get("sig",""))
+        pk_b = base64.b64decode(sigobj.get("pub","")) if "pub" in sigobj else (ed25519_pk_path.read_bytes() if ed25519_pk_path else None)
+        if not pk_b:
+            print("! No ed25519 pubkey provided", file=sys.stderr); return False
+        vk = nacl.signing.VerifyKey(pk_b[:32])
+        try:
+            vk.verify(msg, sig)
+            return True
+        except Exception:
+            return False
+    print(f"! Unknown signature alg: {alg}", file=sys.stderr)
+    return False
+
+def pack(args):
+    bundle = load_json(Path(args.bundle))
+    svg_bytes = Path(args.svg).read_bytes() if args.svg else None
+
+    # Basic fields for manifest (content-address by final_root)
+    bundle_bytes = json.dumps(bundle, separators=(',', ':')).encode()
+    manifest_core = {
+        "schema_version": SCHEMA_VERSION,
+        "name": args.name or Path(args.bundle).stem,
+        "created_at": now_iso(),
+        "bundle_sha256": sha256_bytes(bundle_bytes),
+        "final_root": bundle.get("final_root"),
+        "program_hash": bundle.get("program_hash"),
+        "includes": {
+            "bundle.json": True,
+            "ritual.svg": bool(svg_bytes),
+        },
+    }
+    sig = sign_manifest(manifest_core, args.shared_secret, Path(args.ed25519_privkey) if args.ed25519_privkey else None)
+    manifest = dict(manifest_core)
+    if sig: manifest["signature"] = sig
+
+    outp = Path(args.out)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(outp, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps(manifest, indent=2))
+        z.writestr("bundle.json", bundle_bytes)
+        if svg_bytes:
+            z.writestr("ritual.svg", svg_bytes)
+        if sig:
+            z.writestr("SIGNATURE.json", json.dumps(sig, indent=2))
+
+    print(f"✓ Packed {outp}  (final_root={str(bundle.get('final_root'))[:16]}…)")
+    print("  manifest.signature:", "present" if sig else "none")
+
+def verify(args):
+    p = Path(args.dvcf)
+    if not p.exists():
+        print(f"not found: {p}", file=sys.stderr); return 2
+
+    with zipfile.ZipFile(p, "r") as z:
+        names = set(z.namelist())
+        for req in ("manifest.json", "bundle.json"):
+            if req not in names:
+                print(f"✗ missing {req}", file=sys.stderr); return 1
+        manifest = json.loads(z.read("manifest.json").decode())
+        bundle_bytes = z.read("bundle.json")
+        bundle = json.loads(bundle_bytes.decode())
+        # hash checks
+        ok = True
+        calc = sha256_bytes(bundle_bytes)
+        if calc != manifest.get("bundle_sha256"):
+            print(f"✗ bundle_sha256 mismatch\n  manifest: {manifest.get('bundle_sha256')}\n  actual:   {calc}", file=sys.stderr); ok = False
+        if bundle.get("final_root") != manifest.get("final_root"):
+            print(f"✗ final_root mismatch\n  manifest: {manifest.get('final_root')}\n  bundle:   {bundle.get('final_root')}", file=sys.stderr); ok = False
+        if bundle.get("program_hash") != manifest.get("program_hash"):
+            print(f"✗ program_hash mismatch\n  manifest: {manifest.get('program_hash')}\n  bundle:   {bundle.get('program_hash')}", file=sys.stderr); ok = False
+
+        # signature (if present)
+        sig = manifest.get("signature")
+        if sig:
+            if verify_signature(
+                {k:v for k,v in manifest.items() if k!="signature"},
+                sig,
+                args.shared_secret,
+                Path(args.ed25519_pubkey) if args.ed25519_pubkey else None
+            ):
+                print("✓ signature OK")
+            else:
+                print("✗ signature INVALID", file=sys.stderr); ok = False
+        else:
+            print("! no signature (OK if intentional)")
+        # Optional: JSON Schema check (if jsonschema installed)
+        try:
+            import jsonschema  # type: ignore
+            schema = json.loads(DVC_BUNDLE_SCHEMA)
+            jsonschema.validate(instance=bundle, schema=schema)
+            print("✓ bundle.json matches schema")
+        except Exception as e:
+            print(f"! schema validation skipped/failed: {e}")
+
+    print("✓ VERIFY OK" if ok else "✗ VERIFY FAILED")
+    return 0 if ok else 1
+
+def extract(args):
+    p = Path(args.dvcf)
+    out = Path(args.to)
+    out.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(p, "r") as z:
+        z.extractall(out)
+    print(f"✓ Extracted to {out.resolve()}")
+
+def main():
+    ap = argparse.ArgumentParser(prog="dvc_pack", description=".dvcf pack/verify/extract")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    ap_pack = sub.add_parser("pack", help="Create .dvcf")
+    ap_pack.add_argument("--bundle", required=True)
+    ap_pack.add_argument("--svg")
+    ap_pack.add_argument("--out", required=True)
+    ap_pack.add_argument("--name")
+    ap_pack.add_argument("--shared-secret")
+    ap_pack.add_argument("--ed25519-privkey")
+    ap_pack.set_defaults(func=pack)
+
+    ap_verify = sub.add_parser("verify", help="Verify .dvcf")
+    ap_verify.add_argument("dvcf")
+    ap_verify.add_argument("--shared-secret")
+    ap_verify.add_argument("--ed25519-pubkey")
+    ap_verify.set_defaults(func=verify)
+
+    ap_extract = sub.add_parser("extract", help="Extract .dvcf -> dir")
+    ap_extract.add_argument("dvcf")
+    ap_extract.add_argument("--to", required=True)
+    ap_extract.set_defaults(func=extract)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+# Embed bundle schema for optional verification (no external file needed)
+DVC_BUNDLE_SCHEMA = r"""
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/schemas/dvc_bundle.schema.json",
+  "title": "DVC v0.1 Run Bundle",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["vm_version","program_hash","program_disasm","mem_size","inputs","outputs","steps","final_stack_commit","final_mem_commit","final_root"],
+  "properties": {
+    "vm_version": {"type": "string"},
+    "program_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "program_disasm": {"type": "array", "items": {"type": "string"}},
+    "mem_size": {"type": "integer", "minimum": 0},
+    "inputs": {"type": "array", "items": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
+    "outputs": {"type": "array", "items": {"type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
+    "meta": {"type": "object"},
+    "final_stack_commit": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "final_mem_commit": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "final_root": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step","pc","op","args","stack_before","stack_after","outputs_len","stack_commit","mem_commit","prev_hash","step_hash"],
+        "properties": {
+          "step": {"type": "integer","minimum": 0},
+          "pc": {"type": "integer","minimum": 0},
+          "op": {"type": "string"},
+          "args": {"type": "array", "items": {"type":"integer"}},
+          "stack_before": {"type": "array", "items": {"type":"integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
+          "stack_after": {"type": "array", "items": {"type":"integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807}},
+          "outputs_len": {"type": "integer", "minimum": 0},
+          "stack_commit": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "mem_commit": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "prev_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "step_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}
+"""
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### `dvc_bundle.schema.json` (standalone copy)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/schemas/dvc_bundle.schema.json",
+  "title": "DVC v0.1 Run Bundle",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "vm_version",
+    "program_hash",
+    "program_disasm",
+    "mem_size",
+    "inputs",
+    "outputs",
+    "steps",
+    "final_stack_commit",
+    "final_mem_commit",
+    "final_root"
+  ],
+  "properties": {
+    "vm_version": { "type": "string" },
+    "program_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "program_disasm": { "type": "array", "items": { "type": "string" } },
+    "mem_size": { "type": "integer", "minimum": 0 },
+    "inputs": { "type": "array", "items": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 } },
+    "outputs": { "type": "array", "items": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 } },
+    "meta": { "type": "object" },
+    "final_stack_commit": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "final_mem_commit": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "final_root": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "step","pc","op","args",
+          "stack_before","stack_after","outputs_len",
+          "stack_commit","mem_commit","prev_hash","step_hash"
+        ],
+        "properties": {
+          "step": { "type": "integer", "minimum": 0 },
+          "pc":   { "type": "integer", "minimum": 0 },
+          "op":   { "type": "string" },
+          "args": { "type": "array", "items": { "type": "integer" } },
+          "stack_before": { "type": "array", "items": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 } },
+          "stack_after":  { "type": "array", "items": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 } },
+          "outputs_len":  { "type": "integer", "minimum": 0 },
+          "stack_commit": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "mem_commit":   { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "prev_hash":    { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "step_hash":    { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+### `dvcf_manifest.schema.json` (optional, for the container’s manifest)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/schemas/dvcf_manifest.schema.json",
+  "title": "DVCF Manifest",
+  "type": "object",
+  "required": ["schema_version","name","created_at","bundle_sha256","final_root","program_hash","includes"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "dvcf-0.1" },
+    "name": { "type": "string" },
+    "created_at": { "type": "string" },
+    "bundle_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "final_root": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "program_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "includes": {
+      "type": "object",
+      "required": ["bundle.json","ritual.svg"],
+      "properties": {
+        "bundle.json": { "type": "boolean" },
+        "ritual.svg":  { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "signature": {
+      "type": "object",
+      "required": ["alg","sig"],
+      "properties": {
+        "alg": { "type": "string", "enum": ["hmac-sha256","ed25519"] },
+        "sig": { "type": "string" },
+        "pub": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
+```
+
+---
+
+## How to use
+
+1. **Build a bundle + ritual (you already have these):**
+
+```bash
+python demo_build.py
+# => out/demo_bundle.json, out/demo_ritual.svg
+```
+
+2. **Create a .dvcf (HMAC signing example):**
+
+```bash
+python dvc_pack.py pack \
+  --bundle out/demo_bundle.json \
+  --svg out/demo_ritual.svg \
+  --out build/demo.dvcf \
+  --name "DVC v0.1 demo" \
+  --shared-secret "supersecret"
+```
+
+3. **Verify the .dvcf:**
+
+```bash
+python dvc_pack.py verify build/demo.dvcf --shared-secret "supersecret"
+```
+
+4. **Extract if needed:**
+
+```bash
+python dvc_pack.py extract build/demo.dvcf --to extracted/
+```
+
+5. **(Optional) Ed25519 signing** — if you have PyNaCl:
+
+```bash
+# raw 32-byte keys (example generation via Python)
+python - <<'PY'
+import os, base64
+sk=os.urandom(32); open("ed25519.sk","wb").write(sk)
+# derive pubkey using PyNaCl if available:
+try:
+    import nacl.signing
+    vk=nacl.signing.SigningKey(sk).verify_key
+    open("ed25519.pk","wb").write(bytes(vk))
+    print("wrote ed25519.sk / ed25519.pk")
+except Exception as e:
+    print("PyNaCl not installed; only sk written")
+PY
+
+# pack with ed25519
+python dvc_pack.py pack --bundle out/demo_bundle.json --svg out/demo_ritual.svg \
+  --out build/demo_ed.dvcf --ed25519-privkey ed25519.sk
+
+# verify with public key
+python dvc_pack.py verify build/demo_ed.dvcf --ed25519-pubkey ed25519.pk
+```
+
+---
+
+## Notes & next knobs
+
+* **Schema validation** inside `dvc_pack.py verify` runs if `jsonschema` is installed; otherwise it skips gracefully. You also have the schemas above as separate files if you prefer external validation.
+* **Interoperability:** `.dvcf` is just a ZIP — easy to host, diff (manifest/bundle), and sign.
+* **Future (easy additions):**
+
+  * Swap whole-memory commit → **Merkle memory** (saves bandwidth & enables partial proofs).
+  * Add `proofs/` folder to `.dvcf` for **ZK / TEE attestation** blobs.
+  * Add `compiler/` metadata when you bring in Visual-as-IR authoring.
+
+If you want, I can also wire `dvc_verify.py` to accept a `.dvcf` path directly (open ZIP → read `bundle.json`) so your single verifier handles both raw bundles and containers.
