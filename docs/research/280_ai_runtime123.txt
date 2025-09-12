@@ -1,0 +1,901 @@
+The issue is that the model isn't returning valid JSON. This often happens because smaller or specialized models like `qwen3-zero-coder-reasoning-0.8b-neo-ex` may not follow the bootstrap instructions precisely. Let me update the code to be more robust and add debugging to see what the model actually returned.I've updated the code to be much more robust at handling models that don't return perfect JSON. The new version will:
+
+1. **Show the raw model response** for debugging
+2. **Try multiple JSON extraction methods**
+3. **Use regex to find JSON anywhere in the text**
+4. **Provide a fallback runtime** if no valid JSON is found
+
+Now when you try bootstrapping again, you'll see exactly what the model returned in the output log. The fallback runtime will include a `model_response` command that shows you the raw output.
+
+Try running it again - this time it should work even if the model doesn't return perfect JSON. You'll get either:
+- A properly parsed runtime if the model follows instructions
+- A fallback runtime that shows you what went wrong
+
+Some additional tips for the `qwen3-zero-coder-reasoning` model:
+
+1. **Try a larger model** if available - smaller models often struggle with complex instructions
+2. **Check the model temperature** in LM Studio - set it very low (0.1 or less) for structured output
+3. **Look at the raw response** in the debug output to see what the model actually returned
+
+The fallback runtime will still give you an interactive prompt to experiment with, and it will show you exactly what the model output so we can troubleshoot further if needed.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+LM Studio AI Runtime Bootstrapper
+Connects to LM Studio's local server, lets you select a model, and bootstraps an AI runtime.
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import requests
+import json
+import tempfile
+import subprocess
+import threading
+import pathlib
+import os
+from typing import Dict, List, Optional
+
+# Default LM Studio configuration
+DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+TIMEOUT = 30
+
+# System prompt that teaches the model how to bootstrap
+SYSTEM_PRIMER = """You are an AI runtime bootstrap generator. When you receive the exact trigger "### RUNTIME_BOOTSTRAP ###", respond ONLY with a valid JSON object in this format:
+
+{
+  "manifest": {
+    "name": "ai-runtime",
+    "version": "1.0",
+    "routes": {
+      "print": "ALLOW",
+      "input": "ALLOW", 
+      "file_ops": "EMULATE",
+      "network": "DENY"
+    }
+  },
+  "files": [
+    {
+      "path": "runtime.py",
+      "content": "import sys\\n\\nprint('AI-RT> Runtime ready')\\n\\nwhile True:\\n    try:\\n        cmd = input('AI-RT> ').strip()\\n        if cmd == 'quit' or cmd == 'exit':\\n            break\\n        elif cmd == 'help':\\n            print('Available commands: help, echo <text>, calc <expr>, quit')\\n        elif cmd.startswith('echo '):\\n            print(cmd[5:])\\n        elif cmd.startswith('calc '):\\n            try:\\n                result = eval(cmd[5:])\\n                print(f'Result: {result}')\\n            except Exception as e:\\n                print(f'Error: {e}')\\n        else:\\n            print(f'Unknown command: {cmd}. Type \"help\" for available commands.')\\n    except (EOFError, KeyboardInterrupt):\\n        break\\n\\nprint('AI-RT> Goodbye!')"
+    }
+  ],
+  "entrypoint": "python runtime.py"
+}
+
+Do not include any other text, explanations, or markdown formatting. Output only the JSON object."""
+
+TRIGGER = "### RUNTIME_BOOTSTRAP ###"
+
+class LMStudioBootstrapper:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("LM Studio AI Runtime Bootstrapper")
+        self.root.geometry("600x400")
+        
+        self.base_url = tk.StringVar(value=os.getenv("LMSTUDIO_BASE_URL", DEFAULT_BASE_URL))
+        self.selected_model = tk.StringVar()
+        self.models = []
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        
+        # LM Studio URL
+        ttk.Label(main_frame, text="LM Studio URL:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        url_entry = ttk.Entry(main_frame, textvariable=self.base_url, width=40)
+        url_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
+        
+        # Model selection
+        ttk.Label(main_frame, text="Model:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        
+        model_frame = ttk.Frame(main_frame)
+        model_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        model_frame.columnconfigure(0, weight=1)
+        
+        self.model_combo = ttk.Combobox(model_frame, textvariable=self.selected_model, 
+                                       state="readonly", width=30)
+        self.model_combo.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        refresh_btn = ttk.Button(model_frame, text="Refresh", command=self.refresh_models)
+        refresh_btn.grid(row=0, column=1, padx=(5, 0))
+        
+        # Bootstrap button
+        self.bootstrap_btn = ttk.Button(main_frame, text="Bootstrap AI Runtime", 
+                                       command=self.bootstrap_runtime, state="disabled")
+        self.bootstrap_btn.grid(row=2, column=0, columnspan=2, pady=20)
+        
+        # Status
+        self.status_label = ttk.Label(main_frame, text="Ready - Click Refresh to load models")
+        self.status_label.grid(row=3, column=0, columnspan=2, pady=5)
+        
+        # Output area
+        ttk.Label(main_frame, text="Output:").grid(row=4, column=0, sticky=tk.W, pady=(10, 0))
+        
+        self.output_text = scrolledtext.ScrolledText(main_frame, height=15, width=70)
+        self.output_text.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        main_frame.rowconfigure(5, weight=1)
+        
+        # Auto-refresh models on startup
+        self.root.after(100, self.refresh_models)
+        
+    def log(self, message: str):
+        """Add message to output area"""
+        self.output_text.insert(tk.END, f"{message}\n")
+        self.output_text.see(tk.END)
+        self.root.update_idletasks()
+        
+    def refresh_models(self):
+        """Fetch available models from LM Studio"""
+        self.status_label.config(text="Fetching models...")
+        self.bootstrap_btn.config(state="disabled")
+        
+        try:
+            url = f"{self.base_url.get().rstrip('/')}/models"
+            response = requests.get(url, timeout=TIMEOUT)
+            response.raise_for_status()
+            
+            data = response.json()
+            model_ids = [model.get("id", "") for model in data.get("data", []) if model.get("id")]
+            
+            if not model_ids:
+                raise ValueError("No models found. Load a model in LM Studio → Server tab")
+                
+            self.models = model_ids
+            self.model_combo["values"] = model_ids
+            
+            if model_ids:
+                self.model_combo.current(0)
+                self.bootstrap_btn.config(state="normal")
+                self.status_label.config(text=f"Found {len(model_ids)} model(s)")
+                self.log(f"✓ Loaded {len(model_ids)} models from LM Studio")
+            
+        except Exception as e:
+            self.status_label.config(text=f"Error: {e}")
+            self.log(f"✗ Error fetching models: {e}")
+            
+    def send_chat_request(self, messages: List[Dict]) -> str:
+        """Send chat completion request to LM Studio"""
+        url = f"{self.base_url.get().rstrip('/')}/chat/completions"
+        
+        payload = {
+            "model": self.selected_model.get(),
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 2000,
+            "stream": False
+        }
+        
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        return response.json()["choices"][0]["message"]["content"]
+        
+    def extract_json_from_response(self, text: str) -> Dict:
+        """Extract JSON from model response with extensive debugging"""
+        # Log the raw response for debugging
+        self.log("=== RAW MODEL RESPONSE ===")
+        self.log(repr(text))
+        self.log("=== END RAW RESPONSE ===")
+        
+        # Try to parse the entire response as JSON
+        try:
+            result = json.loads(text.strip())
+            self.log("✓ Successfully parsed entire response as JSON")
+            return result
+        except json.JSONDecodeError as e:
+            self.log(f"× Failed to parse entire response as JSON: {e}")
+            
+        # Look for JSON in markdown code blocks
+        lines = text.split('\n')
+        json_lines = []
+        in_json = False
+        
+        for line in lines:
+            if '```json' in line.lower() or '```JSON' in line:
+                in_json = True
+                self.log("Found JSON code block start")
+                continue
+            elif in_json and '```' in line:
+                self.log("Found JSON code block end")
+                break
+            elif in_json:
+                json_lines.append(line)
+                
+        if json_lines:
+            json_text = '\n'.join(json_lines)
+            self.log(f"Extracted from code block: {repr(json_text)}")
+            try:
+                result = json.loads(json_text)
+                self.log("✓ Successfully parsed JSON from code block")
+                return result
+            except json.JSONDecodeError as e:
+                self.log(f"× Failed to parse JSON from code block: {e}")
+                
+        # Look for JSON object anywhere in the text (more aggressive)
+        import re
+        
+        # Find potential JSON objects using regex
+        json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+        matches = re.findall(json_pattern, text, re.DOTALL)
+        
+        for i, match in enumerate(matches):
+            self.log(f"Trying JSON match {i+1}: {repr(match[:100])}...")
+            try:
+                result = json.loads(match)
+                # Validate it has the expected structure
+                if isinstance(result, dict) and 'manifest' in result and 'files' in result and 'entrypoint' in result:
+                    self.log(f"✓ Successfully parsed JSON match {i+1}")
+                    return result
+                else:
+                    self.log(f"× JSON match {i+1} doesn't have required structure")
+            except json.JSONDecodeError as e:
+                self.log(f"× Failed to parse JSON match {i+1}: {e}")
+                
+        # If no valid JSON found, try to create a minimal fallback
+        self.log("⚠ No valid JSON found, attempting to create fallback runtime...")
+        
+        # Create a simple fallback runtime
+        fallback_runtime = '''import sys
+
+print("AI-RT> Fallback runtime ready (model didn't return valid JSON)")
+
+while True:
+    try:
+        cmd = input('AI-RT> ').strip()
+        if cmd in ('quit', 'exit'):
+            break
+        elif cmd == 'help':
+            print('Available commands: help, echo <text>, model_response, quit')
+        elif cmd.startswith('echo '):
+            print(cmd[5:])
+        elif cmd == 'model_response':
+            print("The model returned:")
+            print(repr(text))
+        else:
+            print(f'Unknown command: {cmd}. Type "help" for available commands.')
+    except (EOFError, KeyboardInterrupt):
+        break
+
+print('AI-RT> Goodbye!')'''
+        
+        return {
+            "manifest": {
+                "name": "fallback-runtime",
+                "version": "1.0",
+                "routes": {"print": "ALLOW", "input": "ALLOW"}
+            },
+            "files": [
+                {"path": "runtime.py", "content": fallback_runtime}
+            ],
+            "entrypoint": "python runtime.py"
+        }
+        
+    def bootstrap_runtime(self):
+        """Bootstrap the AI runtime"""
+        model = self.selected_model.get()
+        if not model:
+            messagebox.showerror("Error", "Please select a model")
+            return
+            
+        self.status_label.config(text="Requesting bootstrap payload...")
+        self.bootstrap_btn.config(state="disabled")
+        self.log(f"🚀 Bootstrapping runtime with model: {model}")
+        
+        try:
+            # Send bootstrap trigger
+            messages = [
+                {"role": "system", "content": SYSTEM_PRIMER},
+                {"role": "user", "content": TRIGGER}
+            ]
+            
+            self.log("📡 Sending bootstrap trigger to model...")
+            response = self.send_chat_request(messages)
+            
+            self.log("📋 Parsing bootstrap payload...")
+            payload = self.extract_json_from_response(response)
+            
+            # Validate payload structure
+            required_keys = ["manifest", "files", "entrypoint"]
+            for key in required_keys:
+                if key not in payload:
+                    raise ValueError(f"Missing required key in payload: {key}")
+                    
+            # Create temporary directory and write files
+            temp_dir = tempfile.mkdtemp(prefix="ai_runtime_")
+            self.log(f"📁 Created runtime directory: {temp_dir}")
+            
+            for file_spec in payload["files"]:
+                file_path = pathlib.Path(temp_dir) / file_spec["path"]
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(file_spec["content"], encoding="utf-8")
+                self.log(f"📄 Wrote: {file_spec['path']}")
+                
+            # Launch runtime
+            entrypoint = payload["entrypoint"]
+            self.log(f"▶️  Launching: {entrypoint}")
+            
+            # Start runtime in a separate thread
+            thread = threading.Thread(target=self.run_runtime, 
+                                    args=(temp_dir, entrypoint), daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            error_msg = f"Bootstrap failed: {e}"
+            self.status_label.config(text="Bootstrap failed")
+            self.log(f"✗ {error_msg}")
+            messagebox.showerror("Bootstrap Error", error_msg)
+        finally:
+            self.bootstrap_btn.config(state="normal")
+            
+    def run_runtime(self, work_dir: str, entrypoint: str):
+        """Run the AI runtime in a subprocess"""
+        try:
+            self.log("🏃 Starting AI runtime process...")
+            
+            # Start the runtime process
+            process = subprocess.Popen(
+                entrypoint,
+                shell=True,
+                cwd=work_dir,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            
+            self.log("✅ AI runtime started! Type commands below:")
+            self.status_label.config(text="AI Runtime active")
+            
+            # Create input field for runtime interaction
+            self.create_runtime_interface(process)
+            
+        except Exception as e:
+            self.log(f"✗ Runtime error: {e}")
+            
+    def create_runtime_interface(self, process):
+        """Create interactive interface for the runtime"""
+        # Create a new window for runtime interaction
+        runtime_window = tk.Toplevel(self.root)
+        runtime_window.title("AI Runtime Terminal")
+        runtime_window.geometry("800x600")
+        
+        # Output area
+        output_area = scrolledtext.ScrolledText(runtime_window, height=20, width=80)
+        output_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Input frame
+        input_frame = ttk.Frame(runtime_window)
+        input_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        ttk.Label(input_frame, text="Command:").pack(side=tk.LEFT)
+        
+        command_var = tk.StringVar()
+        command_entry = ttk.Entry(input_frame, textvariable=command_var)
+        command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
+        
+        def send_command():
+            cmd = command_var.get().strip()
+            if cmd:
+                try:
+                    output_area.insert(tk.END, f"Human> {cmd}\n")
+                    output_area.see(tk.END)
+                    
+                    process.stdin.write(f"{cmd}\n")
+                    process.stdin.flush()
+                    command_var.set("")
+                    
+                    # Read response (non-blocking)
+                    def read_output():
+                        try:
+                            line = process.stdout.readline()
+                            if line:
+                                output_area.insert(tk.END, line)
+                                output_area.see(tk.END)
+                                runtime_window.after(10, read_output)
+                        except:
+                            pass
+                    
+                    runtime_window.after(10, read_output)
+                    
+                except Exception as e:
+                    output_area.insert(tk.END, f"Error: {e}\n")
+                    output_area.see(tk.END)
+        
+        send_btn = ttk.Button(input_frame, text="Send", command=send_command)
+        send_btn.pack(side=tk.RIGHT)
+        
+        # Bind Enter key
+        command_entry.bind("<Return>", lambda e: send_command())
+        command_entry.focus()
+        
+        # Handle window closing
+        def on_closing():
+            try:
+                process.terminate()
+            except:
+                pass
+            runtime_window.destroy()
+            
+        runtime_window.protocol("WM_DELETE_WINDOW", on_closing)
+        
+    def run(self):
+        """Start the GUI application"""
+        self.root.mainloop()
+
+if __name__ == "__main__":
+    app = LMStudioBootstrapper()
+    app.run()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+LM Studio AI Runtime Bootstrapper
+Connects to LM Studio's local server, lets you select a model, and bootstraps an AI runtime.
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import requests
+import json
+import tempfile
+import subprocess
+import threading
+import pathlib
+import os
+from typing import Dict, List, Optional
+
+# Default LM Studio configuration
+DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+TIMEOUT = 30
+
+# System prompt that teaches the model how to bootstrap
+SYSTEM_PRIMER = """You are an AI runtime bootstrap generator. When you receive the exact trigger "### RUNTIME_BOOTSTRAP ###", respond ONLY with a valid JSON object in this format:
+
+{
+  "manifest": {
+    "name": "ai-runtime",
+    "version": "1.0",
+    "routes": {
+      "print": "ALLOW",
+      "input": "ALLOW", 
+      "file_ops": "EMULATE",
+      "network": "DENY"
+    }
+  },
+  "files": [
+    {
+      "path": "runtime.py",
+      "content": "import sys\\n\\nprint('AI-RT> Runtime ready')\\n\\nwhile True:\\n    try:\\n        cmd = input('AI-RT> ').strip()\\n        if cmd == 'quit' or cmd == 'exit':\\n            break\\n        elif cmd == 'help':\\n            print('Available commands: help, echo <text>, calc <expr>, quit')\\n        elif cmd.startswith('echo '):\\n            print(cmd[5:])\\n        elif cmd.startswith('calc '):\\n            try:\\n                result = eval(cmd[5:])\\n                print(f'Result: {result}')\\n            except Exception as e:\\n                print(f'Error: {e}')\\n        else:\\n            print(f'Unknown command: {cmd}. Type \"help\" for available commands.')\\n    except (EOFError, KeyboardInterrupt):\\n        break\\n\\nprint('AI-RT> Goodbye!')"
+    }
+  ],
+  "entrypoint": "python runtime.py"
+}
+
+Do not include any other text, explanations, or markdown formatting. Output only the JSON object."""
+
+TRIGGER = "### RUNTIME_BOOTSTRAP ###"
+
+class LMStudioBootstrapper:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("LM Studio AI Runtime Bootstrapper")
+        self.root.geometry("600x400")
+        
+        self.base_url = tk.StringVar(value=os.getenv("LMSTUDIO_BASE_URL", DEFAULT_BASE_URL))
+        self.selected_model = tk.StringVar()
+        self.models = []
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        
+        # LM Studio URL
+        ttk.Label(main_frame, text="LM Studio URL:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        url_entry = ttk.Entry(main_frame, textvariable=self.base_url, width=40)
+        url_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5)
+        
+        # Model selection
+        ttk.Label(main_frame, text="Model:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        
+        model_frame = ttk.Frame(main_frame)
+        model_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5)
+        model_frame.columnconfigure(0, weight=1)
+        
+        self.model_combo = ttk.Combobox(model_frame, textvariable=self.selected_model, 
+                                       state="readonly", width=30)
+        self.model_combo.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        refresh_btn = ttk.Button(model_frame, text="Refresh", command=self.refresh_models)
+        refresh_btn.grid(row=0, column=1, padx=(5, 0))
+        
+        # Bootstrap button
+        self.bootstrap_btn = ttk.Button(main_frame, text="Bootstrap AI Runtime", 
+                                       command=self.bootstrap_runtime, state="disabled")
+        self.bootstrap_btn.grid(row=2, column=0, columnspan=2, pady=20)
+        
+        # Status
+        self.status_label = ttk.Label(main_frame, text="Ready - Click Refresh to load models")
+        self.status_label.grid(row=3, column=0, columnspan=2, pady=5)
+        
+        # Output area
+        ttk.Label(main_frame, text="Output:").grid(row=4, column=0, sticky=tk.W, pady=(10, 0))
+        
+        self.output_text = scrolledtext.ScrolledText(main_frame, height=15, width=70)
+        self.output_text.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        main_frame.rowconfigure(5, weight=1)
+        
+        # Auto-refresh models on startup
+        self.root.after(100, self.refresh_models)
+        
+    def log(self, message: str):
+        """Add message to output area"""
+        self.output_text.insert(tk.END, f"{message}\n")
+        self.output_text.see(tk.END)
+        self.root.update_idletasks()
+        
+    def refresh_models(self):
+        """Fetch available models from LM Studio"""
+        self.status_label.config(text="Fetching models...")
+        self.bootstrap_btn.config(state="disabled")
+        
+        try:
+            url = f"{self.base_url.get().rstrip('/')}/models"
+            response = requests.get(url, timeout=TIMEOUT)
+            response.raise_for_status()
+            
+            data = response.json()
+            model_ids = [model.get("id", "") for model in data.get("data", []) if model.get("id")]
+            
+            if not model_ids:
+                raise ValueError("No models found. Load a model in LM Studio → Server tab")
+                
+            self.models = model_ids
+            self.model_combo["values"] = model_ids
+            
+            if model_ids:
+                self.model_combo.current(0)
+                self.bootstrap_btn.config(state="normal")
+                self.status_label.config(text=f"Found {len(model_ids)} model(s)")
+                self.log(f"✓ Loaded {len(model_ids)} models from LM Studio")
+            
+        except Exception as e:
+            self.status_label.config(text=f"Error: {e}")
+            self.log(f"✗ Error fetching models: {e}")
+            
+    def send_chat_request(self, messages: List[Dict]) -> str:
+        """Send chat completion request to LM Studio"""
+        url = f"{self.base_url.get().rstrip('/')}/chat/completions"
+        
+        payload = {
+            "model": self.selected_model.get(),
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 2000,
+            "stream": False
+        }
+        
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        return response.json()["choices"][0]["message"]["content"]
+        
+    def extract_json_from_response(self, text: str) -> Dict:
+        """Extract JSON from model response with extensive debugging"""
+        # Log the raw response for debugging
+        self.log("=== RAW MODEL RESPONSE ===")
+        self.log(repr(text))
+        self.log("=== END RAW RESPONSE ===")
+        
+        # Try to parse the entire response as JSON
+        try:
+            result = json.loads(text.strip())
+            self.log("✓ Successfully parsed entire response as JSON")
+            return result
+        except json.JSONDecodeError as e:
+            self.log(f"× Failed to parse entire response as JSON: {e}")
+            
+        # Look for JSON in markdown code blocks
+        lines = text.split('\n')
+        json_lines = []
+        in_json = False
+        
+        for line in lines:
+            if '```json' in line.lower() or '```JSON' in line:
+                in_json = True
+                self.log("Found JSON code block start")
+                continue
+            elif in_json and '```' in line:
+                self.log("Found JSON code block end")
+                break
+            elif in_json:
+                json_lines.append(line)
+                
+        if json_lines:
+            json_text = '\n'.join(json_lines)
+            self.log(f"Extracted from code block: {repr(json_text)}")
+            try:
+                result = json.loads(json_text)
+                self.log("✓ Successfully parsed JSON from code block")
+                return result
+            except json.JSONDecodeError as e:
+                self.log(f"× Failed to parse JSON from code block: {e}")
+                
+        # Look for JSON object anywhere in the text (more aggressive)
+        import re
+        
+        # Find potential JSON objects using regex
+        json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+        matches = re.findall(json_pattern, text, re.DOTALL)
+        
+        for i, match in enumerate(matches):
+            self.log(f"Trying JSON match {i+1}: {repr(match[:100])}...")
+            try:
+                result = json.loads(match)
+                # Validate it has the expected structure
+                if isinstance(result, dict) and 'manifest' in result and 'files' in result and 'entrypoint' in result:
+                    self.log(f"✓ Successfully parsed JSON match {i+1}")
+                    return result
+                else:
+                    self.log(f"× JSON match {i+1} doesn't have required structure")
+            except json.JSONDecodeError as e:
+                self.log(f"× Failed to parse JSON match {i+1}: {e}")
+                
+        # If no valid JSON found, try to create a minimal fallback
+        self.log("⚠ No valid JSON found, attempting to create fallback runtime...")
+        
+        # Create a simple fallback runtime
+        fallback_runtime = '''import sys
+
+print("AI-RT> Fallback runtime ready (model didn't return valid JSON)")
+
+while True:
+    try:
+        cmd = input('AI-RT> ').strip()
+        if cmd in ('quit', 'exit'):
+            break
+        elif cmd == 'help':
+            print('Available commands: help, echo <text>, model_response, quit')
+        elif cmd.startswith('echo '):
+            print(cmd[5:])
+        elif cmd == 'model_response':
+            print("The model returned:")
+            print(repr(text))
+        else:
+            print(f'Unknown command: {cmd}. Type "help" for available commands.')
+    except (EOFError, KeyboardInterrupt):
+        break
+
+print('AI-RT> Goodbye!')'''
+        
+        return {
+            "manifest": {
+                "name": "fallback-runtime",
+                "version": "1.0",
+                "routes": {"print": "ALLOW", "input": "ALLOW"}
+            },
+            "files": [
+                {"path": "runtime.py", "content": fallback_runtime}
+            ],
+            "entrypoint": "python runtime.py"
+        }
+        
+    def bootstrap_runtime(self):
+        """Bootstrap the AI runtime"""
+        model = self.selected_model.get()
+        if not model:
+            messagebox.showerror("Error", "Please select a model")
+            return
+            
+        self.status_label.config(text="Requesting bootstrap payload...")
+        self.bootstrap_btn.config(state="disabled")
+        self.log(f"🚀 Bootstrapping runtime with model: {model}")
+        
+        try:
+            # Send bootstrap trigger
+            messages = [
+                {"role": "system", "content": SYSTEM_PRIMER},
+                {"role": "user", "content": TRIGGER}
+            ]
+            
+            self.log("📡 Sending bootstrap trigger to model...")
+            response = self.send_chat_request(messages)
+            
+            self.log("📋 Parsing bootstrap payload...")
+            payload = self.extract_json_from_response(response)
+            
+            # Validate payload structure
+            required_keys = ["manifest", "files", "entrypoint"]
+            for key in required_keys:
+                if key not in payload:
+                    raise ValueError(f"Missing required key in payload: {key}")
+                    
+            # Create temporary directory and write files
+            temp_dir = tempfile.mkdtemp(prefix="ai_runtime_")
+            self.log(f"📁 Created runtime directory: {temp_dir}")
+            
+            for file_spec in payload["files"]:
+                file_path = pathlib.Path(temp_dir) / file_spec["path"]
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(file_spec["content"], encoding="utf-8")
+                self.log(f"📄 Wrote: {file_spec['path']}")
+                
+            # Launch runtime
+            entrypoint = payload["entrypoint"]
+            self.log(f"▶️  Launching: {entrypoint}")
+            
+            # Start runtime in a separate thread
+            thread = threading.Thread(target=self.run_runtime, 
+                                    args=(temp_dir, entrypoint), daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            error_msg = f"Bootstrap failed: {e}"
+            self.status_label.config(text="Bootstrap failed")
+            self.log(f"✗ {error_msg}")
+            messagebox.showerror("Bootstrap Error", error_msg)
+        finally:
+            self.bootstrap_btn.config(state="normal")
+            
+    def run_runtime(self, work_dir: str, entrypoint: str):
+        """Run the AI runtime in a subprocess"""
+        try:
+            self.log("🏃 Starting AI runtime process...")
+            
+            # Start the runtime process
+            process = subprocess.Popen(
+                entrypoint,
+                shell=True,
+                cwd=work_dir,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            
+            self.log("✅ AI runtime started! Type commands below:")
+            self.status_label.config(text="AI Runtime active")
+            
+            # Create input field for runtime interaction
+            self.create_runtime_interface(process)
+            
+        except Exception as e:
+            self.log(f"✗ Runtime error: {e}")
+            
+    def create_runtime_interface(self, process):
+        """Create interactive interface for the runtime"""
+        # Create a new window for runtime interaction
+        runtime_window = tk.Toplevel(self.root)
+        runtime_window.title("AI Runtime Terminal")
+        runtime_window.geometry("800x600")
+        
+        # Output area
+        output_area = scrolledtext.ScrolledText(runtime_window, height=20, width=80)
+        output_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Input frame
+        input_frame = ttk.Frame(runtime_window)
+        input_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        ttk.Label(input_frame, text="Command:").pack(side=tk.LEFT)
+        
+        command_var = tk.StringVar()
+        command_entry = ttk.Entry(input_frame, textvariable=command_var)
+        command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
+        
+        def send_command():
+            cmd = command_var.get().strip()
+            if cmd:
+                try:
+                    output_area.insert(tk.END, f"Human> {cmd}\n")
+                    output_area.see(tk.END)
+                    
+                    process.stdin.write(f"{cmd}\n")
+                    process.stdin.flush()
+                    command_var.set("")
+                    
+                    # Read response (non-blocking)
+                    def read_output():
+                        try:
+                            line = process.stdout.readline()
+                            if line:
+                                output_area.insert(tk.END, line)
+                                output_area.see(tk.END)
+                                runtime_window.after(10, read_output)
+                        except:
+                            pass
+                    
+                    runtime_window.after(10, read_output)
+                    
+                except Exception as e:
+                    output_area.insert(tk.END, f"Error: {e}\n")
+                    output_area.see(tk.END)
+        
+        send_btn = ttk.Button(input_frame, text="Send", command=send_command)
+        send_btn.pack(side=tk.RIGHT)
+        
+        # Bind Enter key
+        command_entry.bind("<Return>", lambda e: send_command())
+        command_entry.focus()
+        
+        # Handle window closing
+        def on_closing():
+            try:
+                process.terminate()
+            except:
+                pass
+            runtime_window.destroy()
+            
+        runtime_window.protocol("WM_DELETE_WINDOW", on_closing)
+        
+    def run(self):
+        """Start the GUI application"""
+        self.root.mainloop()
+
+if __name__ == "__main__":
+    app = LMStudioBootstrapper()
+    app.run()
