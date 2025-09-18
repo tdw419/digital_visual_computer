@@ -1,0 +1,20 @@
+## Resume, Progress, and Webcam Capture
+
+### Resume + Progress
+Use `--resume` to skip already-encoded frames; lightweight progress lines are printed by default.
+
+Example:
+  python3 scripts/pxrom.py encode tinycore.iso \
+    --out artifacts/tinycore_pxrom_fast \
+    --tiles 128x72 --tile-size 8 \
+    --jobs 4 --compress-level 1 --resume
+
+### Webcam Capture (screen-only)
+Capture PxROM frames from a live display via webcam and reconstruct the payload.
+
+  python3 scripts/pxrom_cam_decode.py \
+    --out artifacts/tinycore_cam.iso \
+    --tiles 128x72 --camera 0 --interval-ms 500 --show
+
+Controls: SPACE/ENTER capture, A auto toggle, Q/ESC quit.
+For robustness (angle/keystone/lighting), next steps: fiducials + homography, gamma handling, ECC.
