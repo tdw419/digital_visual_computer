@@ -1,0 +1,7 @@
+This file is a placeholder for the SDF (Signed Distance Field) font atlas texture.
+
+In a real implementation, this would be a texture file (e.g., a PNG or a raw binary format) containing the pre-generated SDF data for all the glyphs in the font.
+
+The `raster_kernel.wgsl` would load this texture and use it to render text with high quality at any scale.
+
+Generation of this atlas would be a separate build step, likely using a tool like `msdf-atlas-gen`.
