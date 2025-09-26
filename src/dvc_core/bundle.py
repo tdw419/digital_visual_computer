@@ -35,23 +35,23 @@ class DVCBundle:
         zip_info.external_attr = 0o644 << 16  # rw-r--r--
         # zip_info.compress_type = zipfile.ZIP_STORED # No compression for determinism
 
-    def pack(self, 
-             image_path: Path, 
-             palette_path: Path, 
-             program_path: Path, 
-             trace_path: Path, 
+    def pack(self,
+             image_path: Path,
+             palette_path: Path,
+             program_path: Path,
+             trace_path: Path,
              output_bundle_path: Path,
              deterministic_meta: bool = False) -> Dict[str, Any]:
         """Packs DVC assets into a deterministic .dvcf bundle."""
         self.bundle_path = output_bundle_path
-        
+
         if self.bundle_path.exists():
             raise DVCBundleError(f"Output bundle already exists: {self.bundle_path}")
 
         # Create manifest data
         manifest_data = {
             "version": "dvcf-v0.1",
-            "created_at": datetime.now().isoformat(),
+            "created_at": "1970-01-01T00:00:00Z" if deterministic_meta else datetime.now().isoformat(),
             "tool": "dvc-cli",
             "tool_version": "0.1", # Placeholder
             "program": {
@@ -82,63 +82,35 @@ class DVCBundle:
             with open(trace_path, 'r') as f:
                 trace_content = json.load(f)
             manifest_data["trace"]["final_root"] = trace_content.get("meta", {}).get("final_root", "")
-            
-            # Populate provenance from trace.json if available
             if "color_provenance" in trace_content.get("meta", {}):
                 manifest_data["provenance"] = trace_content["meta"]["color_provenance"]
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            raise DVCBundleError(f"Error reading trace file {trace_path}: {e}")
 
-        except json.JSONDecodeError as e:
-            raise DVCBundleError(f"Invalid JSON in trace file {trace_path}: {e}")
-        except FileNotFoundError:
-            raise DVCBundleError(f"Trace file not found: {trace_path}")
-
-        # Write manifest.json to a temporary location
-        temp_manifest_path = self.bundle_path.parent / "manifest.json.tmp"
-        with open(temp_manifest_path, 'w') as f:
-            json.dump(manifest_data, f, indent=2)
-        manifest_data_sha256 = self._calculate_sha256(temp_manifest_path)
-        manifest_data["sha256"] = manifest_data_sha256 # Add manifest hash to manifest itself
-        
-        # Re-write manifest with its own hash included
-        with open(temp_manifest_path, 'w') as f:
-            json.dump(manifest_data, f, indent=2)
+        # Calculate and add the manifest hash
+        canonical_manifest_str = json.dumps(manifest_data, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        manifest_hash = hashlib.sha256(canonical_manifest_str).hexdigest()
+        manifest_data['sha256'] = manifest_hash
 
         # Create the ZIP archive
         with zipfile.ZipFile(self.bundle_path, 'w', zipfile.ZIP_STORED) as zf:
             # Add manifest.json
-            manifest_arcname = "manifest.json"
-            manifest_info = zipfile.ZipInfo(manifest_arcname)
+            manifest_info = zipfile.ZipInfo("manifest.json")
             self._normalize_zip_info(manifest_info)
-            with open(temp_manifest_path, 'rb') as f:
-                zf.writestr(manifest_info, f.read())
+            zf.writestr(manifest_info, json.dumps(manifest_data, indent=2).encode('utf-8'))
 
-            # Add assets
-            asset_files = [
+            # Add other files
+            files_to_add = [
                 (image_path, Path("assets") / image_path.name),
-                (palette_path, Path("assets") / palette_path.name)
+                (palette_path, Path("assets") / palette_path.name),
+                (program_path, Path("build") / program_path.name),
+                (trace_path, Path("trace") / trace_path.name),
             ]
-            for src_path, arc_path in asset_files:
+            for src_path, arc_path in files_to_add:
                 info = zipfile.ZipInfo(str(arc_path))
                 self._normalize_zip_info(info)
                 with open(src_path, 'rb') as f:
                     zf.writestr(info, f.read())
-
-            # Add program.json
-            program_arcname = Path("build") / program_path.name
-            program_info = zipfile.ZipInfo(str(program_arcname))
-            self._normalize_zip_info(program_info)
-            with open(program_path, 'rb') as f:
-                zf.writestr(program_info, f.read())
-
-            # Add trace.json
-            trace_arcname = Path("trace") / trace_path.name
-            trace_info = zipfile.ZipInfo(str(trace_arcname))
-            self._normalize_zip_info(trace_info)
-            with open(trace_path, 'rb') as f:
-                zf.writestr(trace_info, f.read())
-
-        # Clean up temporary manifest file
-        os.remove(temp_manifest_path)
 
         return manifest_data
 
@@ -166,11 +138,16 @@ class DVCBundle:
             except json.JSONDecodeError as e:
                 raise DVCBundleError(f"Invalid JSON in manifest.json: {e}")
 
-            # Verify manifest's own hash (if present)
-            if "sha256" in manifest:
-                calculated_manifest_hash = hashlib.sha256(manifest_content).hexdigest()
-                if calculated_manifest_hash != manifest["sha256"]:
-                    raise DVCBundleError("Manifest SHA256 hash mismatch")
+            # Verify manifest's own hash
+            stored_hash = manifest.pop("sha256", None)
+            if not stored_hash:
+                raise DVCBundleError("Manifest is missing its own SHA256 hash")
+
+            canonical_manifest_str = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            calculated_hash = hashlib.sha256(canonical_manifest_str).hexdigest()
+
+            if calculated_hash != stored_hash:
+                raise DVCBundleError("Manifest SHA256 hash mismatch")
 
             # Verify program file
             program_info = manifest.get("program")

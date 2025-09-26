@@ -85,6 +85,22 @@ def execute(program: Program, step_limit: int = 10_000, deterministic_meta: bool
                 state.outputs.append(val)
                 step.output = str(val)
                 state.ip += 1
+            elif instr.op == "RED_OP":
+                y, x = pop(), pop()
+                state.framebuffer[y][x] = 1
+                state.ip += 1
+            elif instr.op == "GREEN_OP":
+                y, x = pop(), pop()
+                state.framebuffer[y][x] = 2
+                state.ip += 1
+            elif instr.op == "BLUE_OP":
+                y, x = pop(), pop()
+                state.framebuffer[y][x] = 3
+                state.ip += 1
+            elif instr.op == "WHITE_OP":
+                y, x = pop(), pop()
+                state.framebuffer[y][x] = 4
+                state.ip += 1
             else:
                 raise RuntimeError(f"unknown opcode: {instr.op}")
         except Exception as e:
@@ -117,6 +133,7 @@ def execute(program: Program, step_limit: int = 10_000, deterministic_meta: bool
         "final_root": prev,
         "started_at": started_at,
         "finished_at": finished_at,
+        "final_framebuffer": state.framebuffer,
     }
     trace = {
         "meta": meta,

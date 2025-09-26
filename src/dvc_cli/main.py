@@ -10,6 +10,7 @@ from dvc_core.vm import execute
 from dvc_core.verifier import verify_trace
 from lib.program_loader import load_program_json
 from lib.trace_serializer import write_canonical_json, read_json
+from lib.framebuffer_image import save_framebuffer_as_image
 from .color_commands import cmd_color_compile, cmd_color_run
 from dvc_core.bundle import DVCBundle, DVCBundleError
 
@@ -21,19 +22,52 @@ def _print_json(obj: Dict[str, Any]) -> None:
 def cmd_run(args: argparse.Namespace) -> int:
     try:
         program = load_program_json(args.program)
-        limit = int(args.limit) if args.limit is not None else 10_000
-        deterministic_meta = getattr(args, 'deterministic_meta', False)
-        trace = execute(program, step_limit=limit, deterministic_meta=deterministic_meta)
-        write_canonical_json(args.trace, trace)
-        summary = {
-            "status": "halted" if trace["meta"]["halted"] else ("faulted" if trace["meta"]["fault"] else "running"),
-            "steps": len(trace["steps"]),
-            "outputs": trace["meta"]["outputs"],
-            "final_root": trace["meta"]["final_root"],
-            "trace_path": args.trace,
-        }
+
+        if args.gpu:
+            from dvc_core.gpu_runner import run_gpu
+            # Execute on GPU
+            gpu_result = run_gpu(program)
+            # Create a mock trace for summary and framebuffer saving
+            trace = {
+                "meta": {
+                    "halted": gpu_result.get("status") == "halted",
+                    "faulted": gpu_result.get("status") == "faulted",
+                    "outputs": [], # GPU runner doesn't produce outputs yet
+                    "final_root": "N/A (GPU run)",
+                    "final_framebuffer": gpu_result.get("final_framebuffer"),
+                },
+                "steps": [], # No steps for GPU run
+            }
+            summary = {
+                "status": "halted" if trace["meta"]["halted"] else "faulted",
+                "steps": "N/A (GPU run)",
+                "outputs": "N/A (GPU run)",
+                "final_root": "N/A (GPU run)",
+                "trace_path": "N/A (GPU run)",
+            }
+        else:
+            # Execute on CPU
+            limit = int(args.limit) if args.limit is not None else 10_000
+            deterministic_meta = getattr(args, 'deterministic_meta', False)
+            trace = execute(program, step_limit=limit, deterministic_meta=deterministic_meta)
+            write_canonical_json(args.trace, trace)
+            summary = {
+                "status": "halted" if trace["meta"]["halted"] else ("faulted" if trace["meta"]["faulted"] else "running"),
+                "steps": len(trace["steps"]),
+                "outputs": trace["meta"]["outputs"],
+                "final_root": trace["meta"]["final_root"],
+                "trace_path": args.trace,
+            }
+
+        if args.framebuffer_out:
+            framebuffer = trace["meta"].get("final_framebuffer")
+            if framebuffer:
+                save_framebuffer_as_image(framebuffer, args.framebuffer_out)
+                summary["framebuffer_out_path"] = args.framebuffer_out
+
         if args.format == "json":
             _print_json(summary)
+
         return 0 if trace["meta"]["halted"] and not trace["meta"]["faulted"] else (2 if trace["meta"]["faulted"] else 0)
     except Exception as e:
         if args.format == "json":
@@ -80,12 +114,14 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 def cmd_pack(args: argparse.Namespace) -> int:
     try:
+        deterministic_meta = getattr(args, 'deterministic_meta', False)
         manifest_data = DVCBundle(Path(args.out)).pack(
             image_path=Path(args.image),
             palette_path=Path(args.palette),
             program_path=Path(args.program),
             trace_path=Path(args.trace),
-            output_bundle_path=Path(args.out)
+            output_bundle_path=Path(args.out),
+            deterministic_meta=deterministic_meta
         )
         summary = {
             "status": "success",
@@ -118,7 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--trace", required=True, help="Path to write trace JSON")
     pr.add_argument("--limit", required=False, help="Step limit (default 10000)")
     pr.add_argument("--deterministic-meta", action="store_true", help="Use fixed timestamps for byte-identical traces")
+    pr.add_argument("--framebuffer-out", required=False, help="Path to write final framebuffer as PNG")
     pr.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pr.add_argument("--gpu", action="store_true", help="Run on the GPU-based VM")
     pr.set_defaults(func=cmd_run)
 
     pv = sub.add_parser("verify", help="Verify a trace's hash-chain (and optionally semantics)")
@@ -155,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--trace", required=True, help="Path to input trace JSON")
     pp.add_argument("--out", required=True, help="Path to output .dvcf bundle")
     pp.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pp.add_argument("--deterministic-meta", action="store_true", help="Use fixed timestamps for byte-identical bundles")
     pp.set_defaults(func=cmd_pack)
 
     return p
