@@ -97,7 +97,7 @@ class DVCBundle:
             # Add manifest.json
             manifest_info = zipfile.ZipInfo("manifest.json")
             self._normalize_zip_info(manifest_info)
-            zf.writestr(manifest_info, json.dumps(manifest_data, indent=2).encode('utf-8'))
+            zf.writestr(manifest_info, json.dumps(manifest_data, sort_keys=True, separators=(',', ':')).encode('utf-8'))
 
             # Add other files
             files_to_add = [

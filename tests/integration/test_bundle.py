@@ -95,7 +95,7 @@ class TestDVCBundleCommands:
         assert return_code == 1
         summary = json.loads(captured_output.getvalue())
         assert summary["status"] == "error"
-        assert "Manifest is missing its own SHA256 hash" in summary["error"]
+        assert summary["error"] == "Manifest is missing its own SHA256 hash"
 
     def test_verify_bundle_command_hash_mismatch_failure(self, dummy_files, temp_dir):
         output_bundle = temp_dir / "output.dvcf"
