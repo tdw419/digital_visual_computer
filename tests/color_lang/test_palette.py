@@ -6,13 +6,8 @@ import json
 import pytest
 from pathlib import Path
 
-# These imports will fail initially - that's expected for TDD
-try:
-    from src.color_lang.palette import ColorPalette, PaletteError
-except ImportError:
-    # Mark as expected failures until implementation exists
-    ColorPalette = None
-    PaletteError = Exception
+from color_lang.palette import ColorPalette
+from color_lang.exceptions import PaletteError
 
 
 class TestColorPalette:

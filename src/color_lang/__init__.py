@@ -5,8 +5,8 @@ This package provides tools for compiling PNG images into DVC JSON IR using
 palette-driven color-to-opcode mapping.
 """
 
-from .palette import ColorPalette, PaletteError
-from .exceptions import ColorLangError
+from .palette import ColorPalette
+from .exceptions import ColorLangError, PaletteError
 
 __version__ = "0.1.0"
 

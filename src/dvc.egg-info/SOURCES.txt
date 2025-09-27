@@ -1,4 +1,10 @@
 pyproject.toml
+src/color_lang/__init__.py
+src/color_lang/compiler.py
+src/color_lang/decoder.py
+src/color_lang/exceptions.py
+src/color_lang/lower.py
+src/color_lang/palette.py
 src/dvc.egg-info/PKG-INFO
 src/dvc.egg-info/SOURCES.txt
 src/dvc.egg-info/dependency_links.txt
@@ -7,10 +13,12 @@ src/dvc.egg-info/requires.txt
 src/dvc.egg-info/top_level.txt
 src/dvc_cli/__init__.py
 src/dvc_cli/__main__.py
+src/dvc_cli/color_commands.py
 src/dvc_cli/main.py
 src/dvc_cli/commands/run_command.py
 src/dvc_cli/commands/verify_command.py
 src/dvc_core/__init__.py
+src/dvc_core/bundle.py
 src/dvc_core/hash_chain.py
 src/dvc_core/opcodes.py
 src/dvc_core/program.py
@@ -21,3 +29,9 @@ src/dvc_core/vm_state.py
 src/lib/__init__.py
 src/lib/program_loader.py
 src/lib/trace_serializer.py
+src/lib/pixeltext/__init__.py
+src/lib/pixeltext/decoder.py
+src/lib/pixeltext/encoder.py
+src/lib/pixeltext/header.py
+tests/test_pixeltext.py
+tests/test_utils.py

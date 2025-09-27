@@ -49,6 +49,7 @@ addopts = [
     "--strict-config",
     "--verbose",
 ]
+pythonpaths = [".", "src"]
 markers = [
     "contract: CLI contract tests",
     "integration: Integration tests", 
