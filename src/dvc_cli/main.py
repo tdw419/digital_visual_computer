@@ -11,6 +11,7 @@ from dvc_core.verifier import verify_trace
 from lib.program_loader import load_program_json
 from lib.trace_serializer import write_canonical_json, read_json
 from .color_commands import cmd_color_compile, cmd_color_run
+from .pixeltext_commands import cmd_pixeltext_encode, cmd_pixeltext_decode
 from dvc_core.bundle import DVCBundle, DVCBundleError
 
 
@@ -156,6 +157,23 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--out", required=True, help="Path to output .dvcf bundle")
     pp.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
     pp.set_defaults(func=cmd_pack)
+
+    # PixelText Encode command
+    pte = sub.add_parser("pixeltext-encode", help="Encode a file into a PixelText v1.1 PNG cartridge")
+    pte.add_argument("--input", required=True, help="Path to input source file (text, code, etc.)")
+    pte.add_argument("--out", required=True, help="Path to output .ptx.png cartridge")
+    pte.add_argument("--lang", required=False, help="Language hint for the source code (e.g., 'python')")
+    pte.add_argument("--no-ecc", action="store_true", help="Disable Reed-Solomon ECC for a simpler profile")
+    pte.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pte.set_defaults(func=cmd_pixeltext_encode)
+
+    # PixelText Decode command
+    ptd = sub.add_parser("pixeltext-decode", help="Decode and verify a PixelText v1.1 PNG cartridge")
+    ptd.add_argument("--input", required=True, help="Path to input .ptx.png cartridge")
+    ptd.add_argument("--out", required=False, help="Path to write the decoded source content")
+    ptd.add_argument("--no-strict", action="store_true", help="Disable strict SHA256 integrity checks")
+    ptd.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    ptd.set_defaults(func=cmd_pixeltext_decode)
 
     return p
 

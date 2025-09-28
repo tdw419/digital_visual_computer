@@ -1,0 +1,19 @@
+# Byte-compiled and optimized files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Test reports
+.coverage
+.pytest_cache/
+htmlcov/
+
+# VSCode
+.vscode/
+digital_visual_computer.code-workspace
