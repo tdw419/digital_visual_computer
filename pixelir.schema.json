@@ -1,0 +1,46 @@
+{
+  "$schema": "https://ppl.dev/pixelir/v0.json",
+  "version": "0.1.0",
+  "canvas": { "w": 1920, "h": 1080, "format": "rgba8" },
+
+  "assets": [
+    { "id": "atlas:Inter-MSDF-14", "kind": "msdf_atlas",
+      "src": "inter_14.msdf.png", "metrics": { "pxrange": 8 } },
+    { "id": "tex:SpriteSheet", "kind": "image", "src": "sprites.png" }
+  ],
+
+  "timeline": {
+    "fps": 60,
+    "tracks": [
+      { "id": "main", "kind": "ticks",
+        "ops": [ "op-1", "op-2", "op-3" ] }
+    ]
+  },
+
+  "nodes": [
+    { "id": "op-1", "op": "LayerBegin", "layer": 0 },
+    { "id": "op-2", "op": "SpriteBatch",
+      "src": "tex:SpriteSheet",
+      "items": [
+        { "region": [0,0,32,32], "pos": [100,120], "scale": [2,2], "rot": 0.0, "alpha": 1.0 },
+        { "region": [32,0,32,32], "pos": [150,120], "scale": [2,2], "rot": 0.0, "alpha": 0.8 }
+      ],
+      "blend": { "mode": "Over", "alpha": 1.0 }
+    },
+    { "id": "op-3", "op": "Convolve",
+      "region": [0,0,640,360],
+      "kernel": { "type": "gauss", "radius": 3, "separable": true },
+      "policy": { "effect": "Photonic", "quality": "approx", "conf_min": 0.95,
+                  "fallback": "digital" } },
+
+    { "id": "text-hello", "op": "Text",
+      "atlas": "atlas:Inter-MSDF-14",
+      "text": "Hello, PPL!",
+      "pos": [32, 48],
+      "size_px": 14,
+      "color": "#ffffff",
+      "hint": { "kerning": true } },
+
+    { "id": "op-4", "op": "LayerEnd", "layer": 0 }
+  ]
+}

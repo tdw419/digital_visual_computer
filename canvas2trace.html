@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Canvas2D Tracer</title>
+</head>
+<body>
+  <h1>Canvas2D Tracer</h1>
+  <p>This script hooks into the Canvas2D API to log rendering commands. Drop this into any page to log a concise, PPL-ready trace.</p>
+  <canvas id="myCanvas" width="800" height="600" style="border:1px solid #000;"></canvas>
+
+<script>
+(function () {
+  const ORIG = {};
+  const TRACE = { fps: 60, frames: [] };
+  const W = window;
+  const c = HTMLCanvasElement.prototype.getContext;
+
+  HTMLCanvasElement.prototype.getContext = function(type, ...rest){
+    const ctx = c.call(this, type, ...rest);
+    if (type !== '2d') return ctx;
+
+    const rec = (op, args) => {
+      if (TRACE.frames.length === 0) {
+        TRACE.frames.push({ t: performance.now(), ops: [], state: {} });
+      }
+      const a = Array.from(args);
+      TRACE.frames[TRACE.frames.length-1].ops.push({ op, args: a });
+    };
+
+    const wrap = (name) => {
+      ORIG[name] = ctx[name];
+      ctx[name] = function(...args) { rec(name, args); return ORIG[name].apply(this, args); };
+    };
+
+    // minimal useful subset
+    ['drawImage','fillRect','strokeRect','beginPath','moveTo','lineTo','stroke',
+     'fillText','save','restore','translate','scale','rotate','setTransform',
+     'clearRect'].forEach(wrap);
+
+    // properties sampler
+    const props = ['globalAlpha','globalCompositeOperation','filter','font','textAlign','textBaseline','fillStyle','strokeStyle'];
+    setInterval(() => {
+      const f = TRACE.frames[TRACE.frames.length-1];
+      if (!f) return;
+      f.state = Object.fromEntries(props.map(p => [p, ctx[p]]));
+    }, 100);
+
+    // start a recording session automatically
+    if (!TRACE._started) {
+      TRACE._started = true;
+      let last = performance.now();
+      const step = (t) => {
+        if (t - last > (1000/TRACE.fps - 1)) {
+          TRACE.frames.push({ t, ops: [], state: {} });
+          last = t;
+        }
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+      W.addEventListener('beforeunload', () => {
+        const blob = new Blob([JSON.stringify(TRACE, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'session.trace.json';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      });
+    }
+    return ctx;
+  };
+
+  // Example usage:
+  const canvas = document.getElementById('myCanvas');
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = 'red';
+  ctx.fillRect(10, 10, 150, 100);
+
+  ctx.fillStyle = 'blue';
+  ctx.fillRect(50, 50, 150, 100);
+
+  ctx.font = '30px Arial';
+  ctx.fillStyle = 'green';
+  ctx.fillText('Hello World', 200, 200);
+
+})();
+</script>
+</body>
+</html>
