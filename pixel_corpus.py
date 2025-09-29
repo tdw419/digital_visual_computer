@@ -3,6 +3,7 @@
 # v0: docs.pxb.png (bytes), vecs.pxv.png (float32), idx.pxi.png (fixed index)
 
 import os, re, math, json, struct, argparse, glob
+import sqlite3
 from pathlib import Path
 from typing import List, Tuple
 import numpy as np
@@ -214,6 +215,66 @@ def query_corpus(corpus_dir: Path, question: str, top_k: int = 5):
         })
     return results
 
+def export_to_sqlite(corpus_dir: Path, out_file: Path):
+    """Exports the pixel corpus data to a SQLite database."""
+    print(f"Exporting pixel corpus from {corpus_dir} to {out_file}...")
+    if out_file.exists():
+        print(f"Output file {out_file} already exists. Deleting.")
+        out_file.unlink()
+
+    # Load all data from the pixel corpus
+    manifest_path = corpus_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError("manifest.json not found in corpus directory.")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    docs = {d["doc_id"]: d for d in manifest.get("docs", [])}
+
+    recs = load_pxi(corpus_dir / "idx.pxi.png")
+    vecs = load_pxv(corpus_dir / "vecs.pxv.png")
+    docs_png_path = corpus_dir / "docs.pxb.png"
+
+    with sqlite3.connect(out_file) as con:
+        cur = con.cursor()
+
+        # Create tables
+        cur.execute("""
+            CREATE TABLE documents (
+                doc_id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE chunks (
+                chunk_id INTEGER PRIMARY KEY,
+                doc_id INTEGER,
+                content TEXT,
+                embedding BLOB,
+                FOREIGN KEY (doc_id) REFERENCES documents (doc_id)
+            )
+        """)
+
+        # Insert documents
+        for doc_id, doc_info in docs.items():
+            cur.execute("INSERT INTO documents (doc_id, path) VALUES (?, ?)", (doc_id, doc_info['path']))
+
+        # Insert chunks
+        for i, rec in enumerate(recs):
+            doc_id, off, lng, _, _ = rec
+            content = read_range_from_pxb(docs_png_path, off, lng).decode("utf-8", errors="ignore")
+            embedding_blob = vecs[i].tobytes()
+
+            cur.execute(
+                "INSERT INTO chunks (chunk_id, doc_id, content, embedding) VALUES (?, ?, ?, ?)",
+                (i, doc_id, content, embedding_blob)
+            )
+
+        con.commit()
+
+    print(f"Successfully exported {len(docs)} documents and {len(recs)} chunks to {out_file}")
+
+
 # ------------------------------
 # CLI
 # ------------------------------
@@ -233,13 +294,19 @@ def main():
     qry.add_argument("-q", "--question", required=True, help="Your question / search text")
     qry.add_argument("-k", "--topk", type=int, default=5, help="Top-K results (default 5)")
 
+    exp = sub.add_parser("export", help="Export corpus to a SQLite database")
+    exp.add_argument("--corpus", required=True, help="Corpus folder to export from")
+    exp.add_argument("--out", dest="out_file", required=True, help="Output SQLite file path")
+
     args = ap.parse_args()
     if args.cmd == "encode":
         build_corpus(Path(args.in_dir), Path(args.out_dir), dim=args.dim, chunk_chars=args.chunk, pxb_width=args.pxb_width)
-    else:
+    elif args.cmd == "query":
         results = query_corpus(Path(args.corpus), args.question, top_k=args.topk)
         for r in results:
             print(f"[{r['rank']}] score={r['score']:.4f} doc={r['doc_id']} path={r['path']}\n    {r['snippet']}\n")
+    elif args.cmd == "export":
+        export_to_sqlite(Path(args.corpus), Path(args.out_file))
 
 if __name__ == "__main__":
     main()
