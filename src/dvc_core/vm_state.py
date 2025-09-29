@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
+import numpy as np
 
 
 @dataclass
@@ -10,4 +11,5 @@ class VMState:
     stack: List[int] = field(default_factory=list)
     outputs: List[int] = field(default_factory=list)
     status: str = "running"  # running|halted|faulted
+    framebuffer: Optional[np.ndarray] = None
 

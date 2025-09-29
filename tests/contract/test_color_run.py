@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from src.dvc_cli.main import build_parser
-from src.dvc_cli.color_commands import cmd_color_run
+from dvc_cli.main import build_parser
+from dvc_cli.color_commands import cmd_color_run
 
 import io
 from contextlib import redirect_stdout

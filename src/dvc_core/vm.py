@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, Any, List
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from .program import Program
 from .vm_state import VMState
@@ -11,22 +13,29 @@ from .hash_chain import step_hash, ZERO_HASH
 
 
 ISO = "%Y-%m-%dT%H:%M:%SZ"
-
+FONT_PATH = "assets/Roboto-Regular.ttf"
 
 def _to_str_list(vals: List[int]) -> List[str]:
     return [str(v) for v in vals]
 
 
-def execute(program: Program, step_limit: int = 10_000, deterministic_meta: bool = False) -> Dict[str, Any]:
+def execute(
+    program: Program,
+    width: int = 800,
+    height: int = 600,
+    step_limit: int = 10_000,
+    deterministic_meta: bool = False,
+) -> Dict[str, Any]:
     state = VMState(ip=0, stack=[], outputs=[], status="running")
+    state.framebuffer = np.zeros((height, width, 3), dtype=np.uint8)
     steps: List[TraceStep] = []
     prev = ZERO_HASH
-    
+
     if deterministic_meta:
         started_at = "1970-01-01T00:00:00Z"
     else:
         started_at = datetime.now(timezone.utc).strftime(ISO)
-    
+
     faulted = False
 
     def push(x: int) -> None:
@@ -85,6 +94,54 @@ def execute(program: Program, step_limit: int = 10_000, deterministic_meta: bool
                 state.outputs.append(val)
                 step.output = str(val)
                 state.ip += 1
+            elif instr.op == "RECT_FILL":
+                color_packed = pop()
+                h = pop()
+                w = pop()
+                y = pop()
+                x = pop()
+                r = (color_packed >> 16) & 0xFF
+                g = (color_packed >> 8) & 0xFF
+                b = color_packed & 0xFF
+                color = (r, g, b)
+
+                fb = state.framebuffer
+                if fb is not None:
+                    x0 = max(0, x)
+                    y0 = max(0, y)
+                    x1 = min(width, x + w)
+                    y1 = min(height, y + h)
+                    fb[y0:y1, x0:x1] = color
+                state.ip += 1
+            elif instr.op == "TEXT_RENDER":
+                text = instr.arg
+                assert text is not None
+                size = pop()
+                color_packed = pop()
+                y = pop()
+                x = pop()
+
+                r = (color_packed >> 16) & 0xFF
+                g = (color_packed >> 8) & 0xFF
+                b = color_packed & 0xFF
+                color = (r, g, b)
+
+                font = ImageFont.truetype(FONT_PATH, size)
+
+                # Render text on a temporary transparent surface
+                text_width, text_height = font.getbbox(text)[2:]
+                text_surface = Image.new('RGBA', (text_width, text_height), (0,0,0,0))
+                draw = ImageDraw.Draw(text_surface)
+                draw.text((0, 0), text, font=font, fill=(*color, 255))
+
+                # Alpha blend this surface onto the framebuffer
+                fb = state.framebuffer
+                if fb is not None:
+                    img_fb = Image.fromarray(fb)
+                    img_fb.paste(text_surface, (x, y), text_surface)
+                    state.framebuffer = np.array(img_fb)
+
+                state.ip += 1
             else:
                 raise RuntimeError(f"unknown opcode: {instr.op}")
         except Exception as e:
@@ -127,6 +184,7 @@ def execute(program: Program, step_limit: int = 10_000, deterministic_meta: bool
             }
             for s in steps
         ],
+        "framebuffer": state.framebuffer.tolist() if state.framebuffer is not None else None,
     }
     return trace
 

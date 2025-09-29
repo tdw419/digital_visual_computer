@@ -13,6 +13,10 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 Requires-Dist: click>=8.0.0
 Requires-Dist: typing-extensions>=4.0.0
+Requires-Dist: Pillow
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: pygame>=2.5.0
+Requires-Dist: cbor2>=5.4.6
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.0.0; extra == "dev"

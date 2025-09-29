@@ -164,6 +164,76 @@ def cli() -> None:
     # Entry point for console_script if installed
     sys.exit(main())
 
+from timeline_editor.editor_ui import main as timeline_main
+
+def cmd_timeline(args: argparse.Namespace) -> int:
+    """Launcher for the Timeline Editor UI."""
+    try:
+        timeline_main()
+        return 0
+    except Exception as e:
+        sys.stderr.write(f"Error launching timeline editor: {e}\n")
+        return 1
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dvc", description="Digital Visual Computer CLI")
+    sub = p.add_subparsers(dest="command")
+
+    pr = sub.add_parser("run", help="Execute a program and emit a canonical trace")
+    pr.add_argument("--program", required=True, help="Path to program JSON (IR)")
+    pr.add_argument("--trace", required=True, help="Path to write trace JSON")
+    pr.add_argument("--limit", required=False, help="Step limit (default 10000)")
+    pr.add_argument("--deterministic-meta", action="store_true", help="Use fixed timestamps for byte-identical traces")
+    pr.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pr.set_defaults(func=cmd_run)
+
+    pv = sub.add_parser("verify", help="Verify a trace's hash-chain (and optionally semantics)")
+    pv.add_argument("--trace", required=False, help="Path to trace JSON") # Changed to not required
+    pv.add_argument("--bundle", required=False, help="Path to .dvcf bundle") # New argument
+    pv.add_argument("--strict", action="store_true", help="Enable strict checks (reserved)")
+    pv.add_argument("--replay", action="store_true", help="Enable semantic replay mode (reserved)")
+    pv.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pv.set_defaults(func=cmd_verify)
+
+    # Color language commands
+    pcc = sub.add_parser("color-compile", help="Compile PNG color program to DVC JSON IR")
+    pcc.add_argument("--image", required=True, help="Path to PNG color program")
+    pcc.add_argument("--palette", required=True, help="Path to palette JSON")
+    pcc.add_argument("--out", required=True, help="Path to write DVC program JSON")
+    pcc.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pcc.add_argument("--tolerance", required=False, type=float, help="Color matching tolerance")
+    pcc.set_defaults(func=cmd_color_compile)
+
+    pcr = sub.add_parser("color-run", help="Compile and execute PNG color program")
+    pcr.add_argument("--image", required=True, help="Path to PNG color program")
+    pcr.add_argument("--palette", required=True, help="Path to palette JSON")
+    pcr.add_argument("--trace", required=True, help="Path to write execution trace JSON")
+    pcr.add_argument("--limit", required=False, help="Step execution limit (default: 10000)")
+    pcr.add_argument("--deterministic-meta", action="store_true", help="Use fixed timestamps for byte-identical traces")
+    pcr.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pcr.set_defaults(func=cmd_color_run)
+
+    # Pack command
+    pp = sub.add_parser("pack", help="Pack DVC assets into a .dvcf bundle")
+    pp.add_argument("--image", required=True, help="Path to input PNG image")
+    pp.add_argument("--palette", required=True, help="Path to input palette JSON")
+    pp.add_argument("--program", required=True, help="Path to input program JSON (IR)")
+    pp.add_argument("--trace", required=True, help="Path to input trace JSON")
+    pp.add_argument("--out", required=True, help="Path to output .dvcf bundle")
+    pp.add_argument("--format", required=False, choices=["json"], help="Output format for stdout")
+    pp.set_defaults(func=cmd_pack)
+
+    # Timeline editor command
+    pt = sub.add_parser("timeline", help="Launch the Timeline Editor")
+    pt.set_defaults(func=cmd_timeline)
+
+    return p
+
+
+def cli() -> None:
+    # Entry point for console_script if installed
+    sys.exit(main())
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()

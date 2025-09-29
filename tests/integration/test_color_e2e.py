@@ -8,8 +8,8 @@ from pathlib import Path
 from PIL import Image
 import pytest
 
-from src.dvc_cli.main import build_parser
-from src.color_lang.palette import ColorPalette
+from dvc_cli.main import build_parser
+from color_lang.palette import ColorPalette
 
 
 class TestColorLanguageE2E:
@@ -99,7 +99,7 @@ class TestColorLanguageE2E:
         ])
         
         # Execute compilation
-        from src.dvc_cli.color_commands import cmd_color_compile
+        from dvc_cli.color_commands import cmd_color_compile
         import sys
         import io
         import contextlib
@@ -156,7 +156,7 @@ class TestColorLanguageE2E:
         ])
         
         # Execute color-run
-        from src.dvc_cli.color_commands import cmd_color_run
+        from dvc_cli.color_commands import cmd_color_run
         import sys
         import io
         import contextlib
@@ -205,7 +205,7 @@ class TestColorLanguageE2E:
             json.dump(simple_palette, f)
         
         # Compile same program twice
-        from src.dvc_cli.color_commands import cmd_color_compile
+        from dvc_cli.color_commands import cmd_color_compile
         import argparse
         
         # First compilation
@@ -245,7 +245,7 @@ class TestCurrentImplementation:
         import tempfile
         from pathlib import Path
         import argparse
-        from src.dvc_cli.color_commands import cmd_color_compile
+        from dvc_cli.color_commands import cmd_color_compile
         import json
         
         with tempfile.TemporaryDirectory() as tmpdir:

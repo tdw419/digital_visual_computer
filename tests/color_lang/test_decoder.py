@@ -3,10 +3,10 @@ from pathlib import Path
 import json
 from PIL import Image
 
-from src.color_lang.palette import ColorPalette
-from src.color_lang.decoder import PngDecoder
-from src.color_lang.lower import ColorLowerer
-from src.color_lang.compiler import ColorCompiler
+from color_lang.palette import ColorPalette
+from color_lang.decoder import PngDecoder
+from color_lang.lower import ColorLowerer
+from color_lang.compiler import ColorCompiler
 
 @pytest.fixture
 def fixtures_dir():
