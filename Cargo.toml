@@ -1,0 +1,17 @@
+[package]
+name = "gvpie"
+version = "0.0.1"
+edition = "2021"
+
+[features]
+validate = ["dep:naga"]
+
+[dependencies]
+# only used when you pass --features validate
+naga = { version = "0.20", features = ["wgsl-in"], optional = true }
+wgpu = "0.20"
+pollster = "0.3"
+image = "0.25"
+half = { version = "2.4", features = ["use-intrinsics"] }
+anyhow = "1.0"
+notify = "6.1"

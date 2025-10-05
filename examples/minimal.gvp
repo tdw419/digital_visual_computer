@@ -1,0 +1,12 @@
+
+lang 0.1
+texture fb: rgba16f @ 512x512;
+
+kernel render each_pixel {
+  let r = f32(pixel.x) / 512.0;
+  let g = f32(pixel.y) / 512.0;
+  // Swapped r and g
+  vec4(g, r, 0.0, 1.0)
+}
+
+frame { present render; }
