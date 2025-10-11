@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gvpie-gpu",
+    "crates/gvpie-core",
+    "crates/gvpie-editor",
+]
+
+[workspace.dependencies]
+# Add common dependencies here
+wgpu = "0.19"
+winit = "0.29"
+env_logger = "0.11"
+log = "0.4"
+pollster = "0.3"
+bytemuck = { version = "1.14", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+futures-intrusive = "0.5"

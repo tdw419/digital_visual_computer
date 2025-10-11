@@ -1,0 +1,15 @@
+[package]
+name = "gvpie-editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gvpie-gpu = { path = "../gvpie-gpu" }
+gvpie-core = { path = "../gvpie-core" }
+winit = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+pollster = { workspace = true }
+anyhow = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
