@@ -26,7 +26,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         trace = execute(program, step_limit=limit, deterministic_meta=deterministic_meta)
         write_canonical_json(args.trace, trace)
         summary = {
-            "status": "halted" if trace["meta"]["halted"] else ("faulted" if trace["meta"]["fault"] else "running"),
+            "status": "halted" if trace["meta"]["halted"] else ("faulted" if trace["meta"]["faulted"] else "running"),
             "steps": len(trace["steps"]),
             "outputs": trace["meta"]["outputs"],
             "final_root": trace["meta"]["final_root"],

@@ -1,0 +1,37 @@
+[
+    {
+        "op": "PUSHI",
+        "arg": "5"
+    },
+    {
+        "op": "PUSHI",
+        "arg": "4"
+    },
+    {
+        "op": "MUL"
+    },
+    {
+        "op": "PUSHI",
+        "arg": "3"
+    },
+    {
+        "op": "MUL"
+    },
+    {
+        "op": "PUSHI",
+        "arg": "2"
+    },
+    {
+        "op": "MUL"
+    },
+    {
+        "op": "PUSHI",
+        "arg": "1"
+    },
+    {
+        "op": "MUL"
+    },
+    {
+        "op": "PRINT"
+    }
+]
