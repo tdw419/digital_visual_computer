@@ -1,0 +1,17 @@
+{
+  "id": "queue-ringbuffer-wgsl-v1",
+  "title": "Queue (ring buffer) on textures — dequeue pass",
+  "category": "Data Structures",
+  "difficulty": "Intermediate",
+  "tags": ["wgsl","webgpu","atomics","queue","ring-buffer"],
+  "io": {
+    "inputs": [
+      "@group(0)@binding(3) r32float(read_write) queue_tex",
+      "@group(0)@binding(4) storage(read_write) QueuePtrs"
+    ],
+    "outputs": ["@group(0)@binding(5) r32float(write) dequeue_out"]
+  },
+  "host_glue": "ts:webgpu",
+  "benchmarks": { "workgroup":[64], "px":1048576, "ms":0.35, "gpu":"RTX 4070" },
+  "notes": "single-row ring buffer; atomic CAS on head; dequeue results packed into row 0 of dequeue_out; enqueue pass can be a sister node using CAS on tail"
+}

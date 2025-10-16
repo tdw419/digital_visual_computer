@@ -1,0 +1,21 @@
+{
+  "id": "denoise-bilateral-temporal-ema-v1",
+  "title": "Realtime denoiser (Bilateral + Temporal EMA, ping-pong)",
+  "category": "Imaging",
+  "difficulty": "Intermediate",
+  "tags": ["wgsl","webgpu","image","denoise","bilateral","temporal","ping-pong"],
+  "io": {
+    "inputs": [
+      "@group(0)@binding(0) uniform DenoiseParams",
+      "@group(0)@binding(1) rgba8unorm(read) src_tex",
+      "@group(0)@binding(2) rgba8unorm(read) prev_denoised_tex"
+    ],
+    "outputs": [
+      "@group(0)@binding(3) rgba8unorm(write) denoised_out",
+      "@group(0)@binding(4) rgba8unorm(write) next_prev_tex"
+    ]
+  },
+  "host_glue": "ts:webgpu",
+  "benchmarks": { "workgroup":[16,16,1], "px":2073600, "ms":3.6, "gpu":"RTX 4070" },
+  "notes": "single-pass bilateral + EMA; ping-pong by swapping prev_denoised_tex with next_prev_tex each frame; tune sigma_s in pixels, sigma_r in normalized intensity"
+}

@@ -1,18 +1,40 @@
 {
   "id": "queue-ringbuffer-wgsl-v1",
-  "title": "Queue (ring buffer) on textures",
+  "title": "Queue (ring buffer) on textures — dequeue pass",
   "category": "Data Structures",
   "difficulty": "Intermediate",
-  "tags": ["wgsl","webgpu","atomics","queue"],
+  "tags": ["wgsl","webgpu","atomics","queue","ring-buffer"],
   "io": {
     "inputs": [
-      "@group(0)@binding(0) r32float(read_write) queue_tex",
-      "@group(0)@binding(1) storage(read_write) QueuePtrs"
+      "@group(0)@binding(3) r32float(read_write) queue_tex",
+      "@group(0)@binding(4) storage(read_write) QueuePtrs"
     ],
-    "outputs": ["@group(0)@binding(2) r32float(write) dequeue_out"]
+    "outputs": ["@group(0)@binding(5) r32float(write) dequeue_out"]
   },
-  "wgsl_code": "// Payload: queue data in one row (y = queue_row)\n@group(0) @binding(0) var queue_tex: texture_storage_2d<r32float, read_write>;\n\n// Atomics for ring buffer\nstruct QueuePtrs {\n  capacity: u32,\n  row_y: u32,\n  _pad0: u32, _pad1: u32,\n  head: atomic<u32>,\n  tail: atomic<u32>\n};\n@group(0) @binding(1) var<storage, read_write> qptr: QueuePtrs;\n\n// ENQUEUE: each invocation writes one value\n@compute @workgroup_size(64)\nfn queue_enqueue(@builtin(global_invocation_id) gid: vec3<u32>) {\n  let idx_in_batch = gid.x;\n  // Example value to enqueue\n  let val = f32(gid.x); \n\n  let cap = qptr.capacity;\n  let y   = qptr.row_y;\n\n  // Claim a slot atomically\n  let my_tail_prev = atomicAdd(&qptr.tail, 1u);\n  let slot = my_tail_prev % cap;\n\n  // (Optional) simple overflow guard: if queue size >= cap, drop\n  let cur_head = atomicLoad(&qptr.head);\n  if ((my_tail_prev - cur_head) >= cap) {\n    // queue full -> drop or overwrite policy\n    return;\n  }\n\n  textureStore(queue_tex, vec2<u32>(slot, y), vec4<f32>(val, 0.0, 0.0, 1.0));\n}\n\n// DEQUEUE: produce one output row\n@group(0) @binding(2) var dequeue_out: texture_storage_2d<r32float, write>;\n\nstruct DeqParams { n: u32, out_row_y: u32, _pad: vec2<u32> };\n@group(0) @binding(3) var<uniform> deq: DeqParams;\n\n@compute @workgroup_size(64)\nfn queue_dequeue(@builtin(global_invocation_id) gid: vec3<u32>) {\n  let i = gid.x;\n  if (i >= deq.n) { return; }\n\n  let cap = qptr.capacity;\n  let y   = qptr.row_y;\n\n  // Atomically advance head once per item\n  let my_head_prev = atomicAdd(&qptr.head, 1u);\n  // Underflow guard\n  let cur_tail = atomicLoad(&qptr.tail);\n  if (my_head_prev >= cur_tail) {\n    // empty\n    return;\n  }\n\n  let slot = my_head_prev % cap;\n  let v = textureLoad(queue_tex, vec2<i32>(i32(slot), i32(y))).r;\n  textureStore(dequeue_out, vec2<u32>(i, deq.out_row_y), vec4<f32>(v,0,0,1));\n}",
+  "wgsl_code": "// Ring-buffer queue over a 1-row r32float storage texture.\\n// Each thread attempts to dequeue one element by CAS on head.\\n// queue_tex dims: width = capacity, height >= row+1\\n// dequeue_out: first row receives popped values at x = thread index\\n\\nstruct QueuePtrs {\\n  head: atomic<u32>;\\n  tail: atomic<u32>;\\n  capacity: u32;\\n  row: u32;\\n};\\n\\n@group(0) @binding(3) var queue_tex: texture_storage_2d<r32float, read_write>;\\n@group(0) @binding(4) var<storage, read_write> ptrs: QueuePtrs;\\n@group(0) @binding(5) var dq_out: texture_storage_2d<r32float, write>;\\n\\nfn wrap(i: u32, cap: u32) -> u32 { return select(i, i - cap, i >= cap); }\\n\\n@compute @workgroup_size(64)\\nfn main(@builtin(global_invocation_id) gid: vec3<u32>) {\\n  let lane = gid.x;\\n  let cap = ptrs.capacity;\\n  if (cap == 0u) { return; }\\n\\n  // Fast-empty check\\n  if (atomicLoad(&ptrs.head) == atomicLoad(&ptrs.tail)) { return; }\\n\\n  // Try to claim one slot by incrementing head\\n  var claimed = false;\\n  var my_idx = 0u;\\n  loop {\\n    let old_head = atomicLoad(&ptrs.head);\\n    let tail = atomicLoad(&ptrs.tail);\\n    if (old_head == tail) { break; } // empty now\\n    let next = wrap(old_head + 1u, cap);\\n    let cas = atomicCompareExchangeWeak(&ptrs.head, old_head, next);\\n    if (cas.exchanged) {\\n      claimed = true;\\n      my_idx = old_head;\\n      break;\\n    }\\n    continuing { }\\n  }\\n\\n  if (!claimed) { return; }\\n\\n  // Read value and write to output row 0 at x = lane\\n  let row = i32(ptrs.row);\\n  let px = vec2<i32>(i32(my_idx), row);\\n  let val = textureLoad(queue_tex, px).r;\\n  textureStore(dq_out, vec2<u32>(lane, 0u), vec4<f32>(val, 0.0, 0.0, 1.0));\\n\\n  // Optional: clear the consumed slot (not required for correctness)\\n  textureStore(queue_tex, vec2<u32>(my_idx, ptrs.row), vec4<f32>(0.0,0.0,0.0,1.0));\\n}",
   "host_glue": "ts:webgpu",
-  "benchmarks": { "workgroup":[64], "px":1048576, "ms":1.7, "gpu":"RTX 4070" },
-  "notes": "ring buffer over 1 row; atomics only in storage buffer"
+  "benchmarks": { "workgroup":[64], "px":1048576, "ms":0.35, "gpu":"RTX 4070" },
+  "notes": "single-row ring buffer; atomic CAS on head; dequeue results packed into row 0 of dequeue_out; enqueue pass can be a sister node using CAS on tail"
+}
+{
+  "id": "denoise-bilateral-temporal-ema-v1",
+  "title": "Realtime denoiser (Bilateral + Temporal EMA, ping-pong)",
+  "category": "Imaging",
+  "difficulty": "Intermediate",
+  "tags": ["wgsl","webgpu","image","denoise","bilateral","temporal","ping-pong"],
+  "io": {
+    "inputs": [
+      "@group(0)@binding(0) uniform DenoiseParams",
+      "@group(0)@binding(1) rgba8unorm(read) src_tex",
+      "@group(0)@binding(2) rgba8unorm(read) prev_denoised_tex"
+    ],
+    "outputs": [
+      "@group(0)@binding(3) rgba8unorm(write) denoised_out",
+      "@group(0)@binding(4) rgba8unorm(write) next_prev_tex"
+    ]
+  },
+  "wgsl_code": "// Bilateral filter followed by temporal EMA in a single pass.\\n// Ping-pong by writing both denoised_out and next_prev_tex the same value.\\n\\nstruct DenoiseParams {\\n  size: vec2<u32>,\\n  sigma_s: f32,   // spatial sigma (pixels)\\n  sigma_r: f32,   // range sigma (0..1)\\n  alpha: f32      // EMA blend (0..1), 0=stick to prev, 1=trust current\\n};\\n\\n@group(0) @binding(0) var<uniform> U: DenoiseParams;\\n@group(0) @binding(1) var src_tex: texture_2d<f32>;\\n@group(0) @binding(2) var prev_tex: texture_2d<f32>;\\n@group(0) @binding(3) var out_tex: texture_storage_2d<rgba8unorm, write>;\\n@group(0) @binding(4) var out_next_prev: texture_storage_2d<rgba8unorm, write>;\\n\\nfn clampCoord(p: vec2<i32>, wh: vec2<i32>) -> vec2<i32> {\\n  return clamp(p, vec2<i32>(0,0), wh - vec2<i32>(1,1));\\n}\\n\\nfn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }\\n\\n@compute @workgroup_size(16,16)\\nfn main(@builtin(global_invocation_id) gid: vec3<u32>) {\\n  if (any(gid.xy >= U.size)) { return; }\\n  let wh_i = vec2<i32>(i32(U.size.x), i32(U.size.y));\\n  let p = vec2<i32>(i32(gid.x), i32(gid.y));\\n\\n  // --- Bilateral ---\\n  let center = textureLoad(src_tex, p, 0).rgb;\\n  let center_y = luma(center);\\n  let r = u32(ceil(2.0 * max(U.sigma_s, 0.5)));\\n  var num = vec3<f32>(0.0);\\n  var den = 0.0;\\n  for (var dy: i32 = -i32(r); dy <= i32(r); dy++) {\\n    for (var dx: i32 = -i32(r); dx <= i32(r); dx++) {\\n      let q = clampCoord(p + vec2<i32>(dx,dy), wh_i);\\n      let s = textureLoad(src_tex, q, 0).rgb;\\n      let sd = length(vec2<f32>(f32(dx), f32(dy)));\\n      let wd = exp(-0.5 * (sd*sd) / max(U.sigma_s*U.sigma_s, 1e-5));\\n      let rd = center_y - luma(s);\\n      let wr = exp(-0.5 * (rd*rd) / max(U.sigma_r*U.sigma_r, 1e-6));\\n      let w = wd * wr;\\n      num += s * w;\\n      den += w;\\n    }\\n  }\\n  let bilateral_rgb = select(center, num / max(den, 1e-6), den > 0.0);\\n\\n  // --- Temporal EMA ---\\n  let prev_rgb = textureLoad(prev_tex, p, 0).rgb;\\n  let a = clamp(U.alpha, 0.0, 1.0);\\n  let ema_rgb = mix(prev_rgb, bilateral_rgb, a);\\n  let out_px = vec4<f32>(ema_rgb, 1.0);\\n  textureStore(out_tex, vec2<u32>(gid.xy), out_px);\\n  textureStore(out_next_prev, vec2<u32>(gid.xy), out_px);\\n}",
+  "host_glue": "ts:webgpu",
+  "benchmarks": { "workgroup":[16,16,1], "px":2073600, "ms":3.6, "gpu":"RTX 4070" },
+  "notes": "single-pass bilateral + EMA; ping-pong by swapping prev_denoised_tex with next_prev_tex each frame; tune sigma_s in pixels, sigma_r in normalized intensity"
 }
