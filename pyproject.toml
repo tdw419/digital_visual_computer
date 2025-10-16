@@ -48,6 +48,7 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "--verbose",
+    "--tb=short",
 ]
 markers = [
     "contract: CLI contract tests",
