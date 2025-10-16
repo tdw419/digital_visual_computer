@@ -1,9 +1,9 @@
 {
-  "id": "queue-ringbuffer-wgsl-v1",
+  "id": "queue-ringbuffer-dequeue-wgsl-v1",
   "title": "Queue (ring buffer) on textures — dequeue pass",
   "category": "Data Structures",
   "difficulty": "Intermediate",
-  "tags": ["wgsl","webgpu","atomics","queue","ring-buffer"],
+  "tags": ["wgsl","webgpu","atomics","queue","ring-buffer","dequeue"],
   "io": {
     "inputs": [
       "@group(0)@binding(3) r32float(read_write) queue_tex",
@@ -37,6 +37,45 @@
   "host_glue": "ts:webgpu",
   "benchmarks": { "workgroup":[16,16,1], "px":2073600, "ms":3.6, "gpu":"RTX 4070" },
   "notes": "single-pass bilateral + EMA; ping-pong by swapping prev_denoised_tex with next_prev_tex each frame; tune sigma_s in pixels, sigma_r in normalized intensity"
+}
+{
+  "id": "queue-ringbuffer-enqueue-wgsl-v1",
+  "title": "Queue (ring buffer) on textures — enqueue pass",
+  "category": "Data Structures",
+  "difficulty": "Intermediate",
+  "tags": ["wgsl","webgpu","atomics","queue","ring-buffer","enqueue"],
+  "io": {
+    "inputs": [
+      "@group(0)@binding(2) rgba8unorm(read) enqueue_src",
+      "@group(0)@binding(3) r32float(read_write) queue_tex",
+      "@group(0)@binding(4) storage(read_write) QueuePtrs"
+    ],
+    "outputs": ["@group(0)@binding(5) r32float(write) enqueued_mask"]
+  },
+  "wgsl_code": "// Ring-buffer enqueue over a 1-row r32float storage texture.\\n// Each thread attempts to enqueue one value by CAS on tail.\\n// enqueue_src: read values from row 0 at x = thread index (use .r)\\n// queue_tex dims: width = capacity, height >= row+1\\n// enqueued_mask: row 0 gets 1 if this lane enqueued, else 0\\n\\nstruct QueuePtrs {\\n  head: atomic<u32>;\\n  tail: atomic<u32>;\\n  capacity: u32;\\n  row: u32;\\n};\\n\\n@group(0) @binding(2) var enqueue_src: texture_2d<f32>;\\n@group(0) @binding(3) var queue_tex: texture_storage_2d<r32float, read_write>;\\n@group(0) @binding(4) var<storage, read_write> ptrs: QueuePtrs;\\n@group(0) @binding(5) var enq_mask: texture_storage_2d<r32float, write>;\\n\\nfn wrap(i: u32, cap: u32) -> u32 { return select(i, i - cap, i >= cap); }\\n\\n@compute @workgroup_size(64)\\nfn main(@builtin(global_invocation_id) gid: vec3<u32>) {\\n  let lane = gid.x;\\n  let cap = ptrs.capacity;\\n  if (cap == 0u) { return; }\\n\\n  var claimed = false;\\n  var my_idx = 0u;\\n  loop {\\n    let old_tail = atomicLoad(&ptrs.tail);\\n    let head = atomicLoad(&ptrs.head);\\n    let next = wrap(old_tail + 1u, cap);\\n    // Full if next catches head\\n    if (next == head) { break; }\\n    let cas = atomicCompareExchangeWeak(&ptrs.tail, old_tail, next);\\n    if (cas.exchanged) {\\n      claimed = true;\\n      my_idx = old_tail;\\n      break;\\n    }\\n    continuing { }\\n  }\\n\\n  var wrote = 0.0;\\n  if (claimed) {\\n    let val = textureLoad(enqueue_src, vec2<i32>(i32(lane), 0), 0).r;\\n    textureStore(queue_tex, vec2<u32>(my_idx, ptrs.row), vec4<f32>(val, 0.0, 0.0, 1.0));\\n    wrote = 1.0;\\n  }\\n  textureStore(enq_mask, vec2<u32>(lane, 0u), vec4<f32>(wrote, 0.0, 0.0, 1.0));\\n}",
+  "host_glue": "ts:webgpu",
+  "benchmarks": { "workgroup":[64], "px":1048576, "ms":0.32, "gpu":"RTX 4070" },
+  "notes": "CAS on tail; treat queue full when wrap(tail+1)==head; source row index is lane; mask helps CI check how many lanes enqueued"
+}
+{
+  "id": "workqueue-scheduler-wgsl-v1",
+  "title": "Tiny job scheduler (dequeue + atomic per-job counters)",
+  "category": "Data Structures",
+  "difficulty": "Intermediate",
+  "tags": ["wgsl","webgpu","atomics","scheduler","queue","ring-buffer"],
+  "io": {
+    "inputs": [
+      "@group(0)@binding(0) uniform SchedulerParams",
+      "@group(0)@binding(3) r32float(read_write) queue_tex",
+      "@group(0)@binding(4) storage(read_write) QueuePtrs",
+      "@group(0)@binding(6) storage(read_write) JobCounters"
+    ],
+    "outputs": ["@group(0)@binding(5) r32float(write) processed_ids_out"]
+  },
+  "wgsl_code": "// Dequeue one job per lane and bump a per-job atomic counter.\\n// Job ID is derived from the dequeued value (rounded, clamped).\\n// processed_ids_out row 0 gets the processed job id (or -1 if none).\\n\\nstruct QueuePtrs {\\n  head: atomic<u32>;\\n  tail: atomic<u32>;\\n  capacity: u32;\\n  row: u32;\\n};\\n\\nstruct SchedulerParams {\\n  num_counters: u32;\\n  _pad0: vec3<u32>;\\n};\\n\\nstruct JobCounters {\\n  counts: array<atomic<u32>>;\\n};\\n\\n@group(0) @binding(0) var<uniform> P: SchedulerParams;\\n@group(0) @binding(3) var queue_tex: texture_storage_2d<r32float, read_write>;\\n@group(0) @binding(4) var<storage, read_write> ptrs: QueuePtrs;\\n@group(0) @binding(5) var processed_ids_out: texture_storage_2d<r32float, write>;\\n@group(0) @binding(6) var<storage, read_write> JC: JobCounters;\\n\\nfn wrap(i: u32, cap: u32) -> u32 { return select(i, i - cap, i >= cap); }\\n\\n@compute @workgroup_size(64)\\nfn main(@builtin(global_invocation_id) gid: vec3<u32>) {\\n  let lane = gid.x;\\n  let cap = ptrs.capacity;\\n  if (cap == 0u || P.num_counters == 0u) { return; }\\n\\n  // Fast-empty\\n  if (atomicLoad(&ptrs.head) == atomicLoad(&ptrs.tail)) {\\n    textureStore(processed_ids_out, vec2<u32>(lane, 0u), vec4<f32>(-1.0,0.0,0.0,1.0));\\n    return;\\n  }\\n\\n  // Claim one slot by incrementing head\\n  var claimed = false;\\n  var my_idx = 0u;\\n  loop {\\n    let old_head = atomicLoad(&ptrs.head);\\n    let tail = atomicLoad(&ptrs.tail);\\n    if (old_head == tail) { break; }\\n    let next = wrap(old_head + 1u, cap);\\n    let cas = atomicCompareExchangeWeak(&ptrs.head, old_head, next);\\n    if (cas.exchanged) {\\n      claimed = true;\\n      my_idx = old_head;\\n      break;\\n    }\\n    continuing { }\\n  }\\n\\n  if (!claimed) {\\n    textureStore(processed_ids_out, vec2<u32>(lane, 0u), vec4<f32>(-1.0,0.0,0.0,1.0));\\n    return;\\n  }\\n\\n  // Read job value, map to counter index, bump\\n  let px = vec2<i32>(i32(my_idx), i32(ptrs.row));\\n  let val = textureLoad(queue_tex, px).r;\\n  let jid = clamp(i32(round(val)), 0, i32(P.num_counters) - 1);\\n  atomicAdd(&JC.counts[u32(jid)], 1u);\\n  textureStore(processed_ids_out, vec2<u32>(lane, 0u), vec4<f32>(f32(jid),0.0,0.0,1.0));\\n\\n  // Optional: clear consumed slot\\n  textureStore(queue_tex, vec2<u32>(my_idx, ptrs.row), vec4<f32>(0.0,0.0,0.0,1.0));\\n}",
+  "host_glue": "ts:webgpu",
+  "benchmarks": { "workgroup":[64], "px":1048576, "ms":0.40, "gpu":"RTX 4070" },
+  "notes": "SchedulerParams.num_counters sets the counter table size; counters are atomic u32 in a storage buffer; processed_ids_out helps CI assert consumption."
 }{
   "id": "queue-ringbuffer-enqueue-wgsl-v1",
   "title": "Queue (ring buffer) on textures — enqueue pass",
