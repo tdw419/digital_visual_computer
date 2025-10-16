@@ -1,0 +1,18 @@
+{
+  "id": "queue-ringbuffer-wgsl-v1",
+  "title": "Queue (ring buffer) on textures",
+  "category": "Data Structures",
+  "difficulty": "Intermediate",
+  "tags": ["wgsl","webgpu","atomics","queue"],
+  "io": {
+    "inputs": [
+      "@group(0)@binding(0) r32float(read_write) queue_tex",
+      "@group(0)@binding(1) storage(read_write) QueuePtrs"
+    ],
+    "outputs": ["@group(0)@binding(2) r32float(write) dequeue_out"]
+  },
+  "wgsl_code": "// Payload: queue data in one row (y = queue_row)\n@group(0) @binding(0) var queue_tex: texture_storage_2d<r32float, read_write>;\n\n// Atomics for ring buffer\nstruct QueuePtrs {\n  capacity: u32,\n  row_y: u32,\n  _pad0: u32, _pad1: u32,\n  head: atomic<u32>,\n  tail: atomic<u32>\n};\n@group(0) @binding(1) var<storage, read_write> qptr: QueuePtrs;\n\n// ENQUEUE: each invocation writes one value\n@compute @workgroup_size(64)\nfn queue_enqueue(@builtin(global_invocation_id) gid: vec3<u32>) {\n  let idx_in_batch = gid.x;\n  // Example value to enqueue\n  let val = f32(gid.x); \n\n  let cap = qptr.capacity;\n  let y   = qptr.row_y;\n\n  // Claim a slot atomically\n  let my_tail_prev = atomicAdd(&qptr.tail, 1u);\n  let slot = my_tail_prev % cap;\n\n  // (Optional) simple overflow guard: if queue size >= cap, drop\n  let cur_head = atomicLoad(&qptr.head);\n  if ((my_tail_prev - cur_head) >= cap) {\n    // queue full -> drop or overwrite policy\n    return;\n  }\n\n  textureStore(queue_tex, vec2<u32>(slot, y), vec4<f32>(val, 0.0, 0.0, 1.0));\n}\n\n// DEQUEUE: produce one output row\n@group(0) @binding(2) var dequeue_out: texture_storage_2d<r32float, write>;\n\nstruct DeqParams { n: u32, out_row_y: u32, _pad: vec2<u32> };\n@group(0) @binding(3) var<uniform> deq: DeqParams;\n\n@compute @workgroup_size(64)\nfn queue_dequeue(@builtin(global_invocation_id) gid: vec3<u32>) {\n  let i = gid.x;\n  if (i >= deq.n) { return; }\n\n  let cap = qptr.capacity;\n  let y   = qptr.row_y;\n\n  // Atomically advance head once per item\n  let my_head_prev = atomicAdd(&qptr.head, 1u);\n  // Underflow guard\n  let cur_tail = atomicLoad(&qptr.tail);\n  if (my_head_prev >= cur_tail) {\n    // empty\n    return;\n  }\n\n  let slot = my_head_prev % cap;\n  let v = textureLoad(queue_tex, vec2<i32>(i32(slot), i32(y))).r;\n  textureStore(dequeue_out, vec2<u32>(i, deq.out_row_y), vec4<f32>(v,0,0,1));\n}",
+  "host_glue": "ts:webgpu",
+  "benchmarks": { "workgroup":[64], "px":1048576, "ms":1.7, "gpu":"RTX 4070" },
+  "notes": "ring buffer over 1 row; atomics only in storage buffer"
+}
