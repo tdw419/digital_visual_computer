@@ -81,6 +81,8 @@ textColor(text_r, text_g, text_b, 1.0);
     >
     <div id="buttons">
       <button id="run_button">Run</button>
+      <button id="vm_mode_button">Run in VM</button>
+      <button id="debug_vm_button">Debug VM</button>
       <button id="clear_button">Clear state</button>
       <select id="example_select">
         <option value="wave">Example: wave</option>
@@ -142,6 +144,29 @@ textColor(text_r, text_g, text_b, 1.0);
         });
     }
 
+    // --- Pixel VM Resources ---
+    const OPCODE_MAP = {
+      NOP: 0x0, LOAD: 0x1, STORE: 0x2, ADD: 0x3, SUB: 0x4, MUL: 0x5, DIV: 0x6,
+      SIN: 0x7, COS: 0x8, MOV: 0x9, JMP: 0xA, JZ: 0xB, CALL: 0xC, RET: 0xD,
+      SAMPLE: 0xE, HALT: 0xF,
+    };
+    const pcmBuffer = device.createBuffer({
+        size: 1024 * 2, // 1KB of bytecode
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    const regBuffer = device.createBuffer({
+        size: 16 * 4, // 16 float32 registers
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    const memBuffer = device.createBuffer({
+        size: 256 * 256 * 4 * 4, // 256x256 RGBA pixel memory
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.TEXTURE_BINDING
+    });
+    const stackBuffer = device.createBuffer({
+        size: 1024 * 4, // 1KB stack
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+
     // --- Text Rendering ---
     const FONT_ATLAS_SIZE = 1024;
     const GLYPHS_PER_ROW = 16;
@@ -183,6 +208,137 @@ textColor(text_r, text_g, text_b, 1.0);
     let pipeline;
     let bindGroup;
     let userCode = editor.value;
+
+    let vmComputePipeline;
+    let vmRenderPipeline;
+    let vmComputeBindGroup;
+    let vmRenderBindGroup;
+
+    function setupVMPipelines() {
+        const vmComputeModule = device.createShaderModule({
+            code: `
+                struct Registers { values: array<f32, 16>, }
+                struct Memory { pixels: array<vec4f, 65536>, } // 256x256 RGBA
+                @group(0) @binding(0) var<storage, read> code: array<u16>;
+                @group(0) @binding(1) var<storage, read_write> memory: Memory;
+                @group(0) @binding(2) var<storage, read_write> regs: Registers;
+                @group(0) @binding(3) var<storage, read_write> stack: array<u32>;
+                @group(0) @binding(4) var prevFrame: texture_2d<f32>;
+                @group(0) @binding(5) var smplr: sampler;
+
+                var<private> sp: u32 = 0;
+
+                @compute @workgroup_size(8, 8)
+                fn vm_main(@builtin(global_invocation_id) id: vec3<u32>) {
+                    var pc: u32 = 0;
+                    var running: bool = true;
+                    while (running && pc < arrayLength(&code)) {
+                        let instr = code[pc];
+                        let opcode = (instr >> 12) & 0xF;
+                        let op1 = (instr >> 8) & 0xF;
+                        let op2 = instr & 0xFF;
+                        switch (opcode) {
+                            case 0x0: { pc++; } // NOP
+                            case 0x1: { regs.values[op1] = f32(op2); pc++; } // LOAD
+                            case 0x2: { // STORE
+                                let x = op1;
+                                let y = (op2 >> 4) & 0xF;
+                                let chan = op2 & 0xF;
+                                memory.pixels[id.y * 256 + id.x][chan] = regs.values[op1];
+                                pc++;
+                            }
+                            case 0x3: { regs.values[op1] = regs.values[op1] + regs.values[op2]; pc++; } // ADD
+                            case 0x7: { regs.values[op1] = sin(regs.values[op2]); pc++; } // SIN
+                            case 0xB: { // JZ
+                                if (regs.values[op1] == 0.0) {
+                                    pc = u32(op2);
+                                } else {
+                                    pc++;
+                                }
+                            }
+                            case 0xE: { // SAMPLE
+                                let uv = vec2f(regs.values[op1], regs.values[op2]);
+                                regs.values[op1] = textureSample(prevFrame, smplr, uv).r;
+                                pc++;
+                            }
+                            case 0xC: { // CALL
+                                stack[sp] = pc + 1;
+                                sp++;
+                                pc = u32(op1);
+                            }
+                            case 0xD: { // RET
+                                sp--;
+                                pc = stack[sp];
+                            }
+                            case 0xF: { running = false; } // HALT
+                            default: { pc++; }
+                        }
+                    }
+                }
+            `,
+        });
+
+        vmComputePipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: vmComputeModule,
+                entryPoint: 'vm_main',
+            },
+        });
+
+        const vmRenderModule = device.createShaderModule({
+            code: `
+                @group(0) @binding(0) var<storage, read> memory: { pixels: array<vec4f, 65536>, };
+
+                @fragment
+                fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+                    let idx = u32(pos.y) * 256 + u32(pos.x);
+                    return memory.pixels[idx];
+                }
+            `
+        });
+
+        vmRenderPipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: device.createShaderModule({
+                    code: `
+                        @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+                            let pos = array(
+                                vec2f(-1, -1), vec2f(1, -1), vec2f(-1, 1),
+                                vec2f(-1, 1), vec2f(1, -1), vec2f(1, 1)
+                            );
+                            return vec4f(pos[vi], 0.0, 1.0);
+                        }`,
+                }),
+                entryPoint: 'vs',
+            },
+            fragment: {
+                module: vmRenderModule,
+                entryPoint: 'fs',
+                targets: [{ format: canvasFormat }],
+            },
+        });
+
+        vmComputeBindGroup = device.createBindGroup({
+            layout: vmComputePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: pcmBuffer } },
+                { binding: 1, resource: { buffer: memBuffer } },
+                { binding: 2, resource: { buffer: regBuffer } },
+                { binding: 3, resource: { buffer: stackBuffer } },
+                { binding: 4, resource: tex_b.createView() },
+                { binding: 5, resource: device.createSampler() },
+            ],
+        });
+
+        vmRenderBindGroup = device.createBindGroup({
+            layout: vmRenderPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: memBuffer } },
+            ],
+        });
+    }
 
     function setupMainPipeline(fragmentShader) {
       const bindGroupLayout = device.createBindGroupLayout({
@@ -327,35 +483,43 @@ textColor(text_r, text_g, text_b, 1.0);
             .replace(/(\d+)([^f\w.])/g, "$1.0$2")
             .replace(/vec[234]/g, "$&f");
 
-        const shader = `
-            ${uniformDeclarations}
-            ${textDeclarations}
-            ${helperFunctions}
-            ${textRenderFunction}
+        if (debugVM) {
+            setupDebugPipeline();
+            log('VM debug pipeline setup successful.');
+        } else if (useVM) {
+            setupVMPipelines();
+            log('VM pipelines setup successful.');
+        } else {
+            const shader = `
+                ${uniformDeclarations}
+                ${textDeclarations}
+                ${helperFunctions}
+                ${textRenderFunction}
 
-            @fragment
-            fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-                let x = pos.x;
-                let y = pos.y;
-                let width = u.width;
-                let height = u.height;
-                let uv = pos.xy / vec2f(width, height);
-                let t = u.time;
-                let mouse = vec2f(0.0, 0.0); // Placeholder
-                var r, g, b, a: f32;
+                @fragment
+                fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+                    let x = pos.x;
+                    let y = pos.y;
+                    let width = u.width;
+                    let height = u.height;
+                    let uv = pos.xy / vec2f(width, height);
+                    let t = u.time;
+                    let mouse = vec2f(0.0, 0.0); // Placeholder
+                    var r, g, b, a: f32;
 
-                ${transpiledCode}
+                    ${transpiledCode}
 
-                var final_color = vec4f(r, g, b, a);
-                final_color = renderText(pos.xy, final_color);
-                return final_color;
+                    var final_color = vec4f(r, g, b, a);
+                    final_color = renderText(pos.xy, final_color);
+                    return final_color;
+                }
+            `;
+            try {
+                setupMainPipeline(shader);
+                log('Compilation successful.');
+            } catch(e) {
+                log(`Shader compilation error:\n${e.message}`);
             }
-        `;
-        try {
-            setupMainPipeline(shader);
-            log('Compilation successful.');
-        } catch(e) {
-            log(`Shader compilation error:\n${e.message}`);
         }
     }
 
@@ -397,6 +561,177 @@ textColor(text_r, text_g, text_b, 1.0);
 
     textEditor.addEventListener('input', updateGlyphBuffer);
 
+    // --- Pixel VM Compiler ---
+    class PixelAlgebraToPCM {
+        constructor() {
+            this.bytecode = [];
+            this.registerCount = 0;
+        }
+
+        compile(algebra) {
+            this.bytecode = [];
+            this.registerCount = 0;
+            const lines = algebra.split('\n').filter(l => l.trim() && !l.startsWith('//'));
+            for (const line of lines) {
+                if (line.startsWith('if')) {
+                    const condition = line.match(/if \((.*)\)/)[1];
+                    const r = this.compileTerm(condition);
+                    const jump_location = this.bytecode.length + 2; // Jump over the next instruction
+                    this.emit('JZ', r, jump_location);
+                } else if (line.includes('=')) {
+                    const [varName, expr] = line.split('=').map(s => s.trim());
+                    if (['r', 'g', 'b', 'a'].includes(varName)) {
+                        this.compileExpression(expr, varName);
+                    }
+                }
+            }
+            this.emit('HALT');
+            return new Uint16Array(this.bytecode);
+        }
+
+        compileExpression(expr, target) {
+            // Simple regex-based parser for demo (extend with full AST later)
+            if (expr.includes('sin')) {
+                const inner = expr.match(/sin\((.*?)\)/)[1];
+                const [left, right] = inner.split('+').map(s => s.trim());
+                const r1 = this.compileTerm(left); // e.g., x * 0.01
+                const r2 = this.compileTerm(right); // e.g., t
+                const r3 = this.allocRegister();
+                this.emit('ADD', r3, r1, r2);
+                const r4 = this.allocRegister();
+                this.emit('SIN', r4, r3);
+                this.emit('STORE', this.channelToIndex(target), r4);
+            }
+            } else if (expr.includes('prev')) {
+                const inner = expr.match(/prev\((.*?)\)/)[1];
+                const r1 = this.loadValue(inner);
+                const r2 = this.allocRegister();
+                this.emit('SAMPLE', r2, r1);
+                this.emit('STORE', this.channelToIndex(target), r2);
+            }
+            // Add cases for cos, mul, div, etc.
+        }
+
+        compileTerm(term) {
+            if (term.includes('*')) {
+                const [left, right] = term.split('*').map(s => s.trim());
+                const r1 = this.loadValue(left);
+                const r2 = this.loadValue(right);
+                const r3 = this.allocRegister();
+                this.emit('MUL', r3, r1, r2);
+                return r3;
+            }
+            return this.loadValue(term);
+        }
+
+        loadValue(val) {
+            const reg = this.allocRegister();
+            if (['x', 'y', 't', 'width', 'height'].includes(val)) {
+                this.emit('LOAD', reg, this.varToIndex(val));
+            } else if (!isNaN(parseFloat(val))) {
+                this.emit('LOAD', reg, parseFloat(val));
+            }
+            return reg;
+        }
+
+        emit(op, ...operands) {
+            const opcode = OPCODE_MAP[op];
+            let instr = (opcode << 12);
+            if (operands.length === 3) {
+                instr |= (operands[0] << 8) | (operands[1] << 4) | operands[2];
+            } else if (operands.length === 2) {
+                instr |= (operands[0] << 8) | operands[1];
+            } else if (operands.length === 1) {
+                instr |= operands[0];
+            }
+            this.bytecode.push(instr);
+        }
+
+        allocRegister() {
+            return this.registerCount++;
+        }
+
+        varToIndex(varName) {
+            const map = { x: 0, y: 1, t: 2, width: 3, height: 4 };
+            return map[varName] || 0;
+        }
+
+        channelToIndex(channel) {
+            const map = { r: 0, g: 1, b: 2, a: 3 };
+            return map[channel] || 0;
+        }
+    }
+    const pcmCompiler = new PixelAlgebraToPCM();
+    let useVM = false;
+    let debugVM = false;
+    document.getElementById('vm_mode_button').onclick = () => {
+        useVM = !useVM;
+        debugVM = false;
+        log(useVM ? "Running in VM mode" : "Running in WGSL mode");
+        if (useVM) {
+            const bytecode = pcmCompiler.compile(editor.value);
+            device.queue.writeBuffer(pcmBuffer, 0, bytecode.buffer);
+            log(`Bytecode:\n${Array.from(bytecode).map(b => b.toString(16).padStart(4, '0')).join(' ')}`);
+        }
+        compileAndRun();
+    };
+
+    document.getElementById('debug_vm_button').onclick = () => {
+        debugVM = !debugVM;
+        useVM = debugVM; // Debug mode implies VM mode
+        log(debugVM ? "Debugging VM memory" : "Exited debug mode");
+        compileAndRun();
+    };
+
+    function setupDebugPipeline() {
+        const debugShaderModule = device.createShaderModule({
+            code: `
+                struct Memory { pixels: array<vec4f, 65536>, } // 256x256 RGBA
+                @group(0) @binding(0) var<storage, read> memory: Memory;
+
+                @fragment
+                fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+                    let uv = pos.xy / vec2f(256.0, 256.0);
+                    let grid = fract(uv * 16.0);
+                    let color = memory.pixels[u32(pos.y) * 256 + u32(pos.x)];
+                    if (grid.x < 0.05 || grid.y < 0.05) {
+                        return color + vec4f(0.2, 0.2, 0.2, 1.0);
+                    }
+                    return color;
+                }
+            `,
+        });
+
+        pipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: device.createShaderModule({
+                    code: `
+                        @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+                            let pos = array(
+                                vec2f(-1, -1), vec2f(1, -1), vec2f(-1, 1),
+                                vec2f(-1, 1), vec2f(1, -1), vec2f(1, 1)
+                            );
+                            return vec4f(pos[vi], 0.0, 1.0);
+                        }`,
+                }),
+                entryPoint: 'vs',
+            },
+            fragment: {
+                module: debugShaderModule,
+                entryPoint: 'fs',
+                targets: [{ format: canvasFormat }],
+            },
+        });
+
+        bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: memBuffer } },
+            ],
+        });
+    }
+
     // --- Main Loop ---
     function renderLoop() {
         const t = (performance.now() - t0) / 1000.0;
@@ -407,22 +742,43 @@ textColor(text_r, text_g, text_b, 1.0);
 
         const commandEncoder = device.createCommandEncoder();
 
-        // Main render pass
-        const passEncoder = commandEncoder.beginRenderPass({
-            colorAttachments: [{
-                view: tex_a.createView(),
-                loadOp: 'clear',
-                storeOp: 'store',
-                clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            }],
-        });
-        if(pipeline) {
-            passEncoder.setPipeline(pipeline);
-            passEncoder.setBindGroup(0, bindGroup);
-            passEncoder.setBindGroup(1, textBindGroup);
-            passEncoder.draw(6);
+        if (useVM) {
+            const computePass = commandEncoder.beginComputePass();
+            computePass.setPipeline(vmComputePipeline);
+            computePass.setBindGroup(0, vmComputeBindGroup);
+            computePass.dispatchWorkgroups(256 / 8, 256 / 8);
+            computePass.end();
+
+            const renderPass = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: context.getCurrentTexture().createView(),
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                }],
+            });
+            renderPass.setPipeline(vmRenderPipeline);
+            renderPass.setBindGroup(0, vmRenderBindGroup);
+            renderPass.draw(6);
+            renderPass.end();
+        } else {
+            // Main render pass
+            const passEncoder = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: tex_a.createView(),
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                }],
+            });
+            if(pipeline) {
+                passEncoder.setPipeline(pipeline);
+                passEncoder.setBindGroup(0, bindGroup);
+                passEncoder.setBindGroup(1, textBindGroup);
+                passEncoder.draw(6);
+            }
+            passEncoder.end();
         }
-        passEncoder.end();
 
         // Copy to canvas
         commandEncoder.copyTextureToTexture({ texture: tex_a }, { texture: context.getCurrentTexture() }, [canvas.clientWidth, canvas.clientHeight]);
@@ -463,6 +819,8 @@ textColor(text_r, text_g, text_b, 1.0);
         editor.value = examples[e.target.value];
         compileAndRun();
     };
+
+    examples['conditional'] = `r = 0.0\ng=0.0\nb=1.0\nif (x - width/2.0)\nr = 1.0\ng=1.0\nb=0.0\n`;
 
 
     // --- SDF Generation ---
