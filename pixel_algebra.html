@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<meta charset="utf-8" />
+<title>Pixel Algebra (live → WGSL → GPU)</title>
+<style>
+  body {
+    font-family: 'SF Mono', 'Consolas', 'Menlo', monospace;
+    background: #111;
+    color: #eee;
+    display: flex;
+    height: 100vh;
+    margin: 0;
+  }
+  #editor_pane,
+  #render_pane {
+    flex: 1;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+  }
+  #editor_pane {
+    border-right: 1px solid #333;
+  }
+  #editor, #text_editor {
+    width: 100%;
+    background: #222;
+    border: 1px solid #444;
+    color: #eee;
+    font-family: inherit;
+    font-size: 14px;
+    outline: none;
+    flex-grow: 1;
+  }
+  #editor {
+      height: 60%;
+  }
+  #text_editor {
+      margin-top: 1rem;
+      height: 20%;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    background: #000;
+  }
+  button {
+    background: #444;
+    color: #eee;
+    border: 1px solid #666;
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    margin-top: 0.5rem;
+  }
+  #buttons {
+      display: flex;
+      gap: 0.5rem;
+  }
+  #notes {
+    margin-top: 1rem;
+    background: #222;
+    padding: 0.5rem;
+    font-size: 12px;
+    height: 100px;
+    overflow-y: scroll;
+    white-space: pre-wrap;
+  }
+</style>
+<body>
+  <div id="editor_pane">
+    <textarea id="editor">
+r = 0.5 + 0.5 * cos(t + x * 0.01)
+g = 0.5 + 0.5 * cos(t + y * 0.01 + 2.0)
+b = 0.5 + 0.5 * cos(t + x * 0.01 + y * 0.01 + 4.0)
+a = 1.0
+
+// Animate the text color
+let text_r = 0.5 + 0.5 * sin(t * 2.0);
+let text_g = 0.5 + 0.5 * sin(t * 3.0);
+let text_b = 0.5 + 0.5 * sin(t * 5.0);
+textColor(text_r, text_g, text_b, 1.0);
+</textarea
+    >
+    <div id="buttons">
+      <button id="run_button">Run</button>
+      <button id="clear_button">Clear state</button>
+      <select id="example_select">
+        <option value="wave">Example: wave</option>
+        <option value="feedback">Example: feedback</option>
+        <option value="plasma">Example: plasma</option>
+        <option value="text_fx">Example: text fx</option>
+      </select>
+    </div>
+    <div id="notes">init…</div>
+    <textarea id="text_editor">Type in the text area to see your keystrokes rendered by the GPU.</textarea>
+  </div>
+  <div id="render_pane">
+    <canvas></canvas>
+  </div>
+
+  <script type="module">
+    // --- Core Setup ---
+    const canvas = document.querySelector('canvas');
+    const editor = document.getElementById('editor');
+    const textEditor = document.getElementById('text_editor');
+    const notes = document.getElementById('notes');
+    let t0 = performance.now();
+    let frame = 0;
+
+    function log(msg) {
+      notes.textContent = msg;
+      console.log(msg);
+    }
+
+    if (!navigator.gpu) {
+      throw new Error('WebGPU not supported on this browser.');
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error('No appropriate GPUAdapter found.');
+    }
+    const device = await adapter.requestDevice();
+    const context = canvas.getContext('webgpu');
+    const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+      device: device,
+      format: canvasFormat,
+    });
+
+    // --- Uniforms ---
+    const uniformBuffer = device.createBuffer({
+      size: 20, // 5 floats: width, height, time, frame, glyphCount
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    // --- Ping-Pong Textures for Feedback ---
+    let tex_a = createTexture();
+    let tex_b = createTexture();
+    function createTexture() {
+        return device.createTexture({
+            size: [canvas.clientWidth, canvas.clientHeight],
+            format: 'rgba8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+    }
+
+    // --- Text Rendering ---
+    const FONT_ATLAS_SIZE = 1024;
+    const GLYPHS_PER_ROW = 16;
+    const GLYPH_ASCII_START = 32;
+    const NUM_GLYPHS = 95;
+    const MAX_GLYPHS_ON_SCREEN = 1024;
+
+    // 1. Procedural Font Atlas (SDF)
+    const { sdfTexture, charMetrics } = createSDFTexture();
+
+    // 2. Glyph Instance Buffer
+    const glyphBuffer = device.createBuffer({
+        size: MAX_GLYPHS_ON_SCREEN * 24, // 6 floats per glyph (codepoint, x, y, size, r, g, b, a)
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    // 3. Bind Group for Text
+     const textBindGroupLayout = device.createBindGroupLayout({
+        entries: [
+            { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+            { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+            { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+            { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+        ],
+    });
+
+    const textBindGroup = device.createBindGroup({
+        layout: textBindGroupLayout,
+        entries: [
+            { binding: 0, resource: sdfTexture.createView() },
+            { binding: 1, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }) },
+            { binding: 2, resource: { buffer: glyphBuffer } },
+            { binding: 3, resource: { buffer: uniformBuffer } },
+        ],
+    });
+
+
+    // --- Main Pixel Algebra Rendering ---
+    let pipeline;
+    let bindGroup;
+    let userCode = editor.value;
+
+    function setupMainPipeline(fragmentShader) {
+      const bindGroupLayout = device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        ],
+      });
+
+      pipeline = device.createRenderPipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout, textBindGroupLayout] }),
+        vertex: {
+          module: device.createShaderModule({
+            code: `
+                        @vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+                            let pos = array(
+                                vec2f(-1, -1), vec2f(1, -1), vec2f(-1, 1),
+                                vec2f(-1, 1), vec2f(1, -1), vec2f(1, 1)
+                            );
+                            return vec4f(pos[vi], 0.0, 1.0);
+                        }`,
+          }),
+          entryPoint: 'vs',
+        },
+        fragment: {
+          module: device.createShaderModule({ code: fragmentShader }),
+          entryPoint: 'fs',
+          targets: [{ format: canvasFormat }],
+        },
+        primitive: { topology: 'triangle-list' },
+      });
+
+      bindGroup = device.createBindGroup({
+        layout: bindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: uniformBuffer } },
+          { binding: 1, resource: tex_b.createView() },
+          { binding: 2, resource: device.createSampler() },
+        ],
+      });
+    }
+
+    function compileAndRun() {
+        userCode = editor.value;
+        const uniformDeclarations = `
+            struct Uniforms {
+                width: f32,
+                height: f32,
+                time: f32,
+                frame: f32,
+                glyphCount: f32,
+            };
+            @group(0) @binding(0) var<uniform> u: Uniforms;
+            @group(0) @binding(1) var prevFrame: texture_2d<f32>;
+            @group(0) @binding(2) var smplr: sampler;
+        `;
+        const textDeclarations = `
+            struct Glyph {
+                codepoint: u32,
+                x: f32,
+                y: f32,
+                size: f32,
+                r: f32,
+                g: f32,
+                b: f32,
+                a: f32,
+            };
+            struct Glyphs {
+                glyphs: array<Glyph>,
+            };
+            @group(1) @binding(0) var sdf_atlas: texture_2d<f32>;
+            @group(1) @binding(1) var sdf_sampler: sampler;
+            @group(1) @binding(2) var<storage, read> glyph_data: Glyphs;
+        `;
+
+        const helperFunctions = `
+            fn hsv(h: f32, s: f32, v: f32) -> vec3f {
+                let c = v * s;
+                let h_ = h * 6.0;
+                let x = c * (1.0 - abs(h_ % 2.0 - 1.0));
+                var r, g, b: f32;
+                if (h_ < 1.0) { r = c; g = x; b = 0.0; }
+                else if (h_ < 2.0) { r = x; g = c; b = 0.0; }
+                else if (h_ < 3.0) { r = 0.0; g = c; b = x; }
+                else if (h_ < 4.0) { r = 0.0; g = x; b = c; }
+                else if (h_ < 5.0) { r = x; g = 0.0; b = c; }
+                else { r = c; g = 0.0; b = x; }
+                let m = v - c;
+                return vec3f(r + m, g + m, b + m);
+            }
+            fn prev(uv: vec2f) -> vec4f {
+                return textureSample(prevFrame, smplr, uv);
+            }
+        `;
+
+        const textRenderFunction = `
+            var<private> text_color_val: vec4f = vec4f(1.0, 1.0, 1.0, 1.0);
+            fn textColor(r: f32, g: f32, b: f32, a: f32) {
+                text_color_val = vec4f(r, g, b, a);
+            }
+
+            fn renderText(fragCoord: vec2f, baseColor: vec4f) -> vec4f {
+                var color = baseColor;
+                for (var i = 0u; i < u32(u.glyphCount); i = i + 1u) {
+                     let g = glyph_data.glyphs[i];
+                     if (g.codepoint == 0u) { break; }
+
+                     let atlas_uv = get_atlas_uv(g.codepoint, (fragCoord - vec2f(g.x, g.y)) / g.size);
+                     if (atlas_uv.x < 0.0) { continue; }
+
+                     let dist = textureSample(sdf_atlas, sdf_sampler, atlas_uv).r;
+                     let w = fwidth(dist);
+                     let alpha = smoothstep(0.5 - w, 0.5 + w, dist);
+
+                     let glyph_color = text_color_val;
+                     color = mix(color, glyph_color, alpha);
+                }
+                return color;
+            }
+
+            fn get_atlas_uv(codepoint: u32, local_uv: vec2f) -> vec2f {
+                if (codepoint < 32u || codepoint > 126u) { return vec2f(-1.0); }
+                if (local_uv.x < 0.0 || local_uv.x > 1.0 || local_uv.y < 0.0 || local_uv.y > 1.0) { return vec2f(-1.0); }
+
+                let glyph_index = codepoint - 32u;
+                let glyph_x = f32(glyph_index % 16u);
+                let glyph_y = f32(floor(f32(glyph_index) / 16.0));
+
+                let uv_in_cell = local_uv / 16.0;
+                let atlas_uv = vec2f(glyph_x / 16.0, glyph_y / 16.0) + uv_in_cell;
+
+                return atlas_uv;
+            }
+        `;
+
+        // Transpile user code from simple assignments to WGSL
+        let transpiledCode = userCode
+            .replace(/let\s+/g, 'var ')
+            .replace(/const\s+/g, 'let ')
+            .replace(/(\d+\.\d+)/g, "$1f")
+            .replace(/(\d+)([^f\w.])/g, "$1.0$2")
+            .replace(/vec[234]/g, "$&f");
+
+        const shader = `
+            ${uniformDeclarations}
+            ${textDeclarations}
+            ${helperFunctions}
+            ${textRenderFunction}
+
+            @fragment
+            fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+                let x = pos.x;
+                let y = pos.y;
+                let width = u.width;
+                let height = u.height;
+                let uv = pos.xy / vec2f(width, height);
+                let t = u.time;
+                let mouse = vec2f(0.0, 0.0); // Placeholder
+                var r, g, b, a: f32;
+
+                ${transpiledCode}
+
+                var final_color = vec4f(r, g, b, a);
+                final_color = renderText(pos.xy, final_color);
+                return final_color;
+            }
+        `;
+        try {
+            setupMainPipeline(shader);
+            log('Compilation successful.');
+        } catch(e) {
+            log(`Shader compilation error:\n${e.message}`);
+        }
+    }
+
+    // --- Keystroke Handling & Text Buffer Update ---
+    function updateGlyphBuffer() {
+        const text = textEditor.value;
+        const data = new Float32Array(MAX_GLYPHS_ON_SCREEN * 8); // 8 floats per glyph
+        let cursorX = 10.0;
+        let cursorY = 20.0;
+        const fontSize = 16.0;
+        const lineHeight = 20.0;
+        const advance = 9.0;
+
+        for(let i = 0; i < text.length; i++) {
+            const char = text[i];
+            if (i >= MAX_GLYPHS_ON_SCREEN) break;
+
+            if (char === '\n') {
+                cursorX = 10.0;
+                cursorY += lineHeight;
+                continue;
+            }
+
+            const codepoint = char.charCodeAt(0);
+            const offset = i * 8; // 8 floats per glyph
+            data[offset + 0] = codepoint;
+            data[offset + 1] = cursorX;
+            data[offset + 2] = cursorY;
+            data[offset + 3] = fontSize;
+            data[offset + 4] = 1.0; // r
+            data[offset + 5] = 1.0; // g
+            data[offset + 6] = 1.0; // b
+            data[offset + 7] = 1.0; // a
+
+            cursorX += advance;
+        }
+        device.queue.writeBuffer(glyphBuffer, 0, data);
+    }
+
+    textEditor.addEventListener('input', updateGlyphBuffer);
+
+    // --- Main Loop ---
+    function renderLoop() {
+        const t = (performance.now() - t0) / 1000.0;
+        device.queue.writeBuffer(
+            uniformBuffer, 0,
+            new Float32Array([canvas.clientWidth, canvas.clientHeight, t, frame, textEditor.value.length])
+        );
+
+        const commandEncoder = device.createCommandEncoder();
+
+        // Main render pass
+        const passEncoder = commandEncoder.beginRenderPass({
+            colorAttachments: [{
+                view: tex_a.createView(),
+                loadOp: 'clear',
+                storeOp: 'store',
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            }],
+        });
+        if(pipeline) {
+            passEncoder.setPipeline(pipeline);
+            passEncoder.setBindGroup(0, bindGroup);
+            passEncoder.setBindGroup(1, textBindGroup);
+            passEncoder.draw(6);
+        }
+        passEncoder.end();
+
+        // Copy to canvas
+        commandEncoder.copyTextureToTexture({ texture: tex_a }, { texture: context.getCurrentTexture() }, [canvas.clientWidth, canvas.clientHeight]);
+
+        // Ping-pong
+        commandEncoder.copyTextureToTexture({ texture: tex_a }, { texture: tex_b }, [canvas.clientWidth, canvas.clientHeight]);
+
+        device.queue.submit([commandEncoder.finish()]);
+
+        frame++;
+        requestAnimationFrame(renderLoop);
+    }
+
+    // --- UI & Examples ---
+    document.getElementById('run_button').onclick = compileAndRun;
+    document.getElementById('clear_button').onclick = () => {
+        // This is a bit of a hack, we just draw a black screen to the feedback buffer
+        const commandEncoder = device.createCommandEncoder();
+        commandEncoder.beginRenderPass({
+            colorAttachments: [{
+                view: tex_b.createView(),
+                loadOp: 'clear',
+                storeOp: 'store',
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            }]
+        }).end();
+        device.queue.submit([commandEncoder.finish()]);
+        log("State cleared.");
+    };
+
+    const examples = {
+        wave: `r = 0.5 + 0.5 * cos(t + x * 0.01)\ng = 0.5 + 0.5 * cos(t + y * 0.01 + 2.0)\nb = 0.5 + 0.5 * cos(t + x * 0.01 + y * 0.01 + 4.0)\na = 1.0`,
+        feedback: `let p = prev(uv);\nr = p.r * 0.95 + 0.05 * (0.5 + 0.5 * sin(t));\ng = p.g * 0.95 + 0.05 * (0.5 + 0.5 * cos(t));\nb = p.b * 0.95 + 0.05;\na = 1.0;`,
+        plasma: `let v = 0.0;\nv = v + sin(x * 0.1 + t);\nv = v + sin(y * 0.1 + t);\nv = v + sin((x + y) * 0.1 + t);\nv = v + sin(sqrt(x*x + y*y) * 0.1 + t);\nlet cx = x + 0.5 * sin(t / 5.0);\nlet cy = y + 0.5 * cos(t / 3.0);\nv = v / 4.0;\nr = sin(v * 3.14);\ng = cos(v * 3.14);\nb = sin(v * 3.14 + 3.14 / 2.0);\na = 1.0;`,
+        text_fx: `r = 0.1;\ng = 0.1;\nb = 0.1;\na = 1.0;\n\n// Animate text color and position\nlet wave = sin(x * 0.05 + t) * 10.0;\ntextColor(0.5 + 0.5 * sin(t), 0.5 + 0.5 * cos(t), 1.0, 1.0);\n// (Position animation requires modifying the text renderer itself)\n`
+    };
+    document.getElementById('example_select').onchange = (e) => {
+        editor.value = examples[e.target.value];
+        compileAndRun();
+    };
+
+
+    // --- SDF Generation ---
+    function createSDFTexture() {
+        const canvasSDF = document.createElement('canvas');
+        canvasSDF.width = FONT_ATLAS_SIZE;
+        canvasSDF.height = FONT_ATLAS_SIZE;
+        const ctx = canvasSDF.getContext('2d');
+        const charSize = FONT_ATLAS_SIZE / GLYPHS_PER_ROW;
+        const fontSize = charSize * 0.8;
+
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, FONT_ATLAS_SIZE, FONT_ATLAS_SIZE);
+        ctx.fillStyle = 'white';
+        ctx.font = `${fontSize}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+
+        const charMetrics = {};
+
+        for (let i = 0; i < NUM_GLYPHS; i++) {
+            const charCode = GLYPH_ASCII_START + i;
+            const char = String.fromCharCode(charCode);
+            const x = (i % GLYPHS_PER_ROW) * charSize + charSize / 2;
+            const y = Math.floor(i / GLYPHS_PER_ROW) * charSize + charSize / 2;
+            ctx.fillText(char, x, y);
+            charMetrics[charCode] = { x: i % GLYPHS_PER_ROW, y: Math.floor(i/GLYPHS_PER_ROW), width: 1, height: 1 };
+        }
+
+        const imageData = ctx.getImageData(0, 0, FONT_ATLAS_SIZE, FONT_ATLAS_SIZE);
+        const sdfData = new Uint8Array(FONT_ATLAS_SIZE * FONT_ATLAS_SIZE);
+
+        // Naive SDF generation (slow, but works for a demo)
+        for (let y = 0; y < FONT_ATLAS_SIZE; y++) {
+            for (let x = 0; x < FONT_ATLAS_SIZE; x++) {
+                const isInside = imageData.data[(y * FONT_ATLAS_SIZE + x) * 4] > 128;
+                let minDistSq = Infinity;
+
+                for (let j = 0; j < FONT_ATLAS_SIZE; j++) {
+                    for (let i = 0; i < FONT_ATLAS_SIZE; i++) {
+                        const isOpposite = imageData.data[(j * FONT_ATLAS_SIZE + i) * 4] > 128 !== isInside;
+                        if (isOpposite) {
+                            const distSq = (x-i)*(x-i) + (y-j)*(y-j);
+                            if (distSq < minDistSq) {
+                                minDistSq = distSq;
+                            }
+                        }
+                    }
+                }
+                const dist = Math.sqrt(minDistSq);
+                const signedDist = isInside ? dist : -dist;
+                const normalizedDist = Math.max(0, Math.min(255, 128 + signedDist * 10)); // Scale factor 10
+                sdfData[y * FONT_ATLAS_SIZE + x] = normalizedDist;
+            }
+        }
+
+        const texture = device.createTexture({
+            size: [FONT_ATLAS_SIZE, FONT_ATLAS_SIZE, 1],
+            format: 'r8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        device.queue.writeTexture(
+            { texture },
+            sdfData,
+            { bytesPerRow: FONT_ATLAS_SIZE },
+            { width: FONT_ATLAS_SIZE, height: FONT_ATLAS_SIZE }
+        );
+        return { sdfTexture: texture, charMetrics };
+    }
+
+    // --- Initial Run ---
+    compileAndRun();
+    updateGlyphBuffer();
+    requestAnimationFrame(renderLoop);
+
+  </script>
+</body>
